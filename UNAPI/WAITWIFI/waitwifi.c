@@ -1,11 +1,21 @@
 /*
 --
 -- waitwifi.c
+--   Added explanation about /T
+--   KdL updated the animation so it won't update as much as it was updating before,
+--   so it is easier on the eye
+--   Revision 0.13
+--
+--   Revision by Luca Chiodi (KdL), thanks!
+--   Added /T parameter (= terse output) to show only the connection result.
+--   Minor text improvements.
+--   Revision 0.12
+--
 --   Wait up to 10 seconds for the first TCP-IP UNAPI implementation to be connected.
 --   Useful for WiFi modules that need time to connect after UNAPI is loaded.
 --   Revision 0.11
 --
--- Requires SDCC and Fusion-C library
+-- Requires SDCC
 -- Copyright (c) 2019-2020 Oduvaldo Pavan Junior ( ducasp@ gmail.com )
 -- All rights reserved.
 --
@@ -35,9 +45,7 @@
 */
 #include <stdio.h>
 #include <string.h>
-#include <stdlib.h>
-#include "fusion-c/header/msx_fusion.h"
-#include "fusion-c/header/asm.h"
+#include "asm.h"
 
 __at 0xFC9E unsigned int TickCount;
 unsigned char uchMessage[255];
@@ -81,15 +89,16 @@ enum TcpipErrorCodes {
     ERR_INV_OPER
 };
 
-const char strPresentation[] = "UNAPI TCP Wait Connection Tool v0.11\r\n(c)2020 Oduvaldo Pavan Junior\r\nducasp@gmail.com\r\n\r\n\r\n";
+const char strPresentation[] = "UNAPI TCP Wait Connection Tool v0.13\r\n(c)2020 Oduvaldo Pavan Junior - ducasp@gmail.com\r\n\n";
 
 Z80_registers regs;
 int i;
+int HideStr;
 uint specVersion;
 unapi_code_block codeBlock;
-//This variable will hold JIFFY value, that is increased every VDP interrupt,
-//that means usually it will be increased 60 (NTSC/PAL-M) or 50 (PAL) times
-//every second
+// This variable will hold JIFFY value, that is increased every VDP interrupt,
+// that means usually it will be increased 60 (NTSC/PAL-M) or 50 (PAL) times
+// every second
 __at 0xFC9E unsigned int TickCount;
 
 // This print function has been copied from HGET / Konamiman
@@ -157,9 +166,12 @@ void PrintImplementationName()
 
 int main (char** argv, int argc)
 {
-    unsigned int TimeOut,Time1,TimeLeap;
+    unsigned int Time0,Time1,TimeOut,TimeLeap;
     unsigned char advance[4] = {'-','\\','|','/'};
 
+    TickCount = 0;
+
+    Time0 = TickCount + 5;
     // Timeout for a packet
     Time1 = TickCount;
     TimeOut = 600 + Time1;
@@ -168,29 +180,38 @@ int main (char** argv, int argc)
     else
         TimeLeap = 0;
 
-    print(strPresentation);
+    i = 0;
+    // Check if the terse parameter is set
+    if ((argv[i][0]=='/') && ( (argv[i][1]=='t') || (argv[i][1]=='T')) )
+        HideStr = 0;
+    else
+        HideStr = -1;
+
+    if (HideStr)
+        print(strPresentation);
 
     i = UnapiGetCount("TCP/IP");
     if(i==0)
     {
-        print("No TCP/IP UNAPI implementations found");
+        print("No TCP/IP UNAPI implementations found\r\n\n");
         return 1;
     }
 
     UnapiBuildCodeBlock(NULL, 1, &codeBlock);
 
     i = 0;
-    PrintImplementationName();
-    printChar('W');
+    if (HideStr)
+        PrintImplementationName();
+
     do
     {
-        //Check if timeout expired
+        // Check if timeout expired
         if (TimeLeap == 0)
         {
             if (TickCount>TimeOut)
             {
-                print("Time-out and not connected!\r\n");
-                break;
+                print("\rTime-out and not connected!\r\n\n");
+                return 1;
             }
         }
         else
@@ -203,23 +224,27 @@ int main (char** argv, int argc)
             }
         }
 
-        //Our nice animation to show we are not stuck
-        printChar(8); //backspace
-        printChar(advance[i%4]); // next char
-        ++i;
-        //Check Connection
+        // Our nice animation to show we are not stuck
+        if (TickCount>Time0)
+        {
+            Time0 = TickCount + 5;
+            printChar(advance[i%4]); // next char
+            printChar(29); // move left a char
+            ++i;
+        }
+        // Check Connection
         UnapiCall(&codeBlock, TCPIP_NET_STATE, &regs, REGS_NONE, REGS_MAIN);
     }
     while (regs.Bytes.B != 2);
 
     if (regs.Bytes.B == 2)
     {
-        print("Connected!\r\n");
+        print("\rConnected!\r\n\n");
         return 0;
     }
     else
     {
-        print("Not connected...\r\n");
+        print("\rNot connected...\r\n\n");
         return 1;
     }
 }

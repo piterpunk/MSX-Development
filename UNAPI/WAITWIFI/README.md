@@ -1,3 +1,15 @@
+# WAITWIFI v0.13
+
+KdL was very kind by improving animation to not look jerky
+Forgot to document the TERSE option implemented by KDL in v0.12:
+
+	- If you use WAITWIFI /T it will use TERSE mode, so it won't output text
+	  unless there is an error or when connection is made
+
+# WAITWIFI v0.12
+
+KdL was very kind by improving the text output of the tool
+
 # WAITWIFI v0.11
 
 Changed the routines that print to screen from the ones in fusion-c to the one
