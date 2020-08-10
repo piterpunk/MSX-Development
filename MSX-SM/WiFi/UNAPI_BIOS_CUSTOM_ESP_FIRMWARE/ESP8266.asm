@@ -7,6 +7,10 @@
 ; Pieces of this code were based on DENYOTCP.ASM (Denyonet ROM)
 ; made by Konamiman
 ;
+; This code also has contributions from KdL, most specifically in the Wi-Fi
+; setup menus and functionality, he has helped quite a lot to get it to the
+; final format and functionality, thanks!
+;
 ; Note: this implementation depends upon ESP8266 having the UNAPI
 ; firmware flashed. This firmware has been developed by me as well.
 ;
@@ -17,10 +21,12 @@
 ; Design details:
 ; There are three instances of this ROM
 ;
-; 1 - ESC is pressed during boot, it will skip and won't load
+; 1 - If configured as disabled in set-up menu item 4, it won't load at all
 ; 2 - F1 is pressed during boot, it will show a setup menu, ESC resume boot
-; 3 - No key is pressed during boot or setup is done, EXTBIO HOOK for UNAPI
-;     calls and HTIM_I hook for internal usage
+; 3 - No key is pressed during boot or setup is done, it is enabled (default),
+;     EXTBIO HOOK for UNAPI calls is installed and HTIM_I hook for internal
+;     usage and a few bytes at top of TPA are reserved upon the first UNAPI
+;     function being called
 ;
 ; As a ROM, our segment is read only, so for RAM needs we need to use RAM not
 ; in our page. This ROM will do the following:
@@ -33,22 +39,23 @@
 ; ), in such case, that BASIC software or trick will most likely be corrupted
 ; after running our setup.
 ;
-; After boot, we need RAM in the 4th page. We have the SLOT WORK AREA for
-; free, it is 8 bytes reserved for our slot, and that is certainly not enough,
-; just the EXTBIOS HOOK backup cost us 5 bytes, so we have three bytes 
-; remaining. Of those, we use two to indicate the bottom of the memory reserved
-; in the 4th page. Whenever more memory is needed, HIMEM_RESERVED_SIZE must 
-; change, just remember that more memory reserved means less memory available
-; to applications and BASIC, so use it wisely
+; After boot, we need RAM in the 4th page. We have the SLOT WORK AREA for free,
+; it is 8 bytes reserved for our slot, and that is certainly not enough, just
+; the EXTBIOS HOOK backup cost us 5 bytes, so we have three bytes remaining. Of
+; those, we use two to indicate the bottom of the memory reserved in the 4th
+; page. Whenever more memory is needed, HIMEM_RESERVED_SIZE must change, just
+; remember that more memory reserved means less memory available to
+; applications and BASIC, so use it wisely
 ;
 ; Slot Work Area Details
 ; 0000 - 0004	: EXTBIO hook backup
 ; 0005 - 0006	: HIMEM Allocated area (starts with 00 xx, once allocated goes
-;				  to Fxxx or Exxx so checking 0006 if 00 is enough)
+;				  to Fxxx or Exxx so checking 0005 if 00 is enough)
+; 007			: Unused
 ;
 ; Current HIMEM mapping offset related to the address stored in the 6th and 7th
 ; bytes of our slot work area:
-; 
+;
 ; 0000 - 0004 	: HTIM_I hook backup
 ; 0005 - 0006	: Counter that our HTIM_I hook updates
 ; 0007			: Store Single Byte some functions need
@@ -59,6 +66,7 @@
 ;	000D - 000E	: C and B
 ;	000F - 0010	: D and E
 ;	0011 - 0012	: H and L
+; 0013 - 001D	: Unused
 ;
 ; As this is sitting on a slot, there is a resoanable chance that this is initialized
 ; before any disk controllers. If that is the case, allocating memory at HIMEM is bad
@@ -68,7 +76,8 @@
 ; initialize. No disk available...
 ; 2 - Disk Controller doesn't care and simply wipe-out memory below original HIMEM at
 ; boot to create the disk interfaces static work area, thus, causing our allocated
-; memory to be overwritten...
+; memory to be overwritten and MSX will most likely crash on ther first VDP interrupt
+; after that...
 ;
 ; So, allocating memory at cartridge startup will make MSX freeze or misbehave or not
 ; have the disk available if our ROM is sitting in a slot lower than the disk. There
@@ -87,45 +96,59 @@
 ;
 ; So, for the moment the design decision is option #2
 ;
-; Setup Menu Design
-;
 
+;*************************
+;***  BUILD DEFINITIONS **
+;*************************
+
+;--- SM-X ROM is less verbose...
+SMX_ROM:				equ	1
+;--- Non-FPGA versions do not check OCM hardware...
+CHECK_OCM_HW:			equ	1
+;--- FPGA Version can have the Turbo-R logo incorporated or not...
+TURBO_R_LOGO:			equ	1
 
 ;*******************
 ;***  CONSTANTS  ***
 ;*******************
 
-;--- SM-X ROM is less verbose
-SMX_ROM:				equ	1
-
-;--- System variables and routines
-KILBUF:					equ	#0156
+;--- System variables and routines:
+CHSNS:					equ	#009C
+CHGET:					equ	#009F
+CHPUT:					equ	#00A2
 BEEP:					equ	#00C0
 SNSMAT:					equ	#0141
-CHPUT:					equ	#00A2
-CHGET:					equ	#009F
+KILBUF:					equ	#0156
+LINLEN:					equ	#F3B0
+CLIKSW:					equ	#F3DB
 TXTTAB:					equ	#F676
+ARG:					equ	#F847
 HOKVLD:					equ	#FB20
+HIMEM:					equ	#FC4A
 EXPTBL:					equ	#FCC1
 SLTWRK:					equ	#FD09
-HIMEM:					equ	#FC4A
-EXTBIO:					equ	#FFCA
-ARG:					equ	#F847
 H_TIMI:					equ	#FD9F
 H_CLEA:					equ	#FED0
-OUT_TX_PORT:			equ	#07
+EXTBIO:					equ	#FFCA
+
+;--- I/O ports:
 OUT_CMD_PORT:			equ	#06
+OUT_TX_PORT:			equ	#07
 IN_DATA_PORT:			equ	#06
 IN_STS_PORT:			equ	#07
+PORT_F2:				equ	#F2
 
-;--- API version and implementation version
+;--- API version and implementation version:
 API_V_P:				equ	1
 API_V_S:				equ	2
 ROM_V_P:				equ	1
 ROM_V_S:				equ	2
 
-;--- Size of memory to reserv in upper memory AREA
+;--- Size of memory to reserve in upper TPA:
 HIMEM_RESERVED_SIZE		equ	30
+
+;--- Layout of our TPA area:
+H_TIM_BACKUP_OFFSET		equ	0
 MEMORY_COUNTER_OFFSET	equ	5
 MEMORY_SB_VAR_OFFSET	equ	7
 MEMORY_DNS_READY_OFFSET	equ	8
@@ -136,15 +159,18 @@ MEMORY_BCBACKUP_OFFSET	equ	#0D
 MEMORY_DEBACKUP_OFFSET	equ	#0F
 MEMORY_HLBACKUP_OFFSET	equ	#11
 
-;--- Maximum number of available standard and implementation-specific function numbers
-;Must be 0 to 127
+;--- Scan Page Size
+SCAN_MAX_PAGE_SIZE		equ	8
+
+;--- Maximum number of available standard and implementation-specific function
+;--- numbers. Must be 0 to 127.
 MAX_FN:					equ	29
 
-;Must be either zero (if no implementation-specific functions available), or 128 to 254
+;--- Must be either zero (if no implementation-specific functions available),
+;--- or 128 to 254.
 MAX_IMPFN:				equ	0
 
-;--- TCP/IP UNAPI error codes
-
+;--- TCP/IP UNAPI error codes:
 ERR_OK:					equ	0
 ERR_NOT_IMP:			equ	1
 ERR_NO_NETWORK:			equ	2
@@ -187,19 +213,83 @@ INIT:
 	ld	a,h							; Let's test if we are mirrored and being executed in wrong page
 	cp	#40							; is MSB 0x40?
 	ret	nz							; if not, return, it is a mirror
+	if	CHECK_OCM_HW = 1
+	; Below code has been kindly provided by KdL
+	ld	a,#d4						; set OCM ID = 212
+	out	(#40),a
+	in	a,(#49)						; Let's test the Machine Type ID
+	and	%00111100
+	rra
+	rra
+	cp	0							; is the ID = 0?
+	ret	z							; if yes, return, it is 1chipMSX
+	cp	1							; is the ID = 1?
+	ret	z							; if yes, return, it is Zemmix Neo
+	; ### Remove the next line to use the ROM with the emulators ###
+	cp	15							; is the ID = 15?
+	ret	z							; if yes, return, it is Unknown or a generic MSX system
+	; Ok, ID = 2 "SM-X" or ID > 2 "Newer Machines"
+	endif
+	ld	a,29						; ensures width 29
+	ld	(LINLEN),a					; for the current text mode
+	xor	a							; A = 0
+	ld	(CLIKSW),a					; when key press, click disabled
 	ld	a,6
 	call	SNSMAT
-	bit	5,a							; Test F1
-	jp	z,ESPSETUP					; If F1 is pressed, let's execute our setup menu
+	bit	5,a							; Test [F1]
+	jp	z,ENTERING_ESPSETUP			; If F1 is pressed, let's execute our setup menu
+	bit	6,a							; Test [F2]
+	jr	z,BOOT_FROM_POWER_OFF		; If F2 is pressed, let's proceed as "boot from power off"
+	ld	a,8
+	call	SNSMAT
+	bit	3,a							; Test [DEL]
+	ret	z							; If DEL is pressed, UNAPI driver is not loaded and exits
+	; We check if the Port F2 device is available
+	in	a,(PORT_F2)					; a = #FF, default value if it comes from power off or hard reset
+	cpl								; a = #FF - a
+	ld	c,a							; c = #00
+	out	(PORT_F2),a					; a = #00
+	ld	b,12
+WAIT_200MS:
+	halt							; Wait 200ms to ensure a successful hard reset
+	djnz	WAIT_200MS
+	in	a,(PORT_F2)					; a = #00?
+	cpl								; a = #FF - a
+	out	(PORT_F2),a					; a = #FF?
+	cp	c							; If not a = c, port #F2 is writable and available
+	jr	z,BOOT_FROM_POWER_OFF		; If a = c, port #F2 is not available, let's proceed as "boot from power off"
+	; Ok, Port F2 device available
+	cp	#EF							; ESP Not Found
+	ret	z							; If yes, UNAPI driver is not loaded and exits
+	cp	#F0							; UNAPI driver has been loaded at least once
+	jp	z,INIT_NOCLOCKUPDAT2		; If yes, proceed without affecting the connection or the date and time
+	cp	#F1							; User requested to go directly to Wi-Fi Setup
+	jp	z,ENTERING_ESPSETUP			; If yes, let's execute our setup menu
+	cp	#FE							; Unexpected error from the previous reboot
+	jr  nz,BOOT_FROM_POWER_OFF		; If no one is confirmed, let's proceed as "boot from power off"
+	; Oops! An unexpected error occurred on the last reboot
+	ld	hl,STR_OOPS					; Print Oops! An unexpected error message
+	call	PRINTHL					; and let's proceed as "boot from power off"
+	ld	b,120						; Wait 2 seconds with message on screen
+WAIT_2S:
+	halt
+	djnz	WAIT_2S					; If not zero, our time out has not elapsed
+	ld	a,CLS
+	call	CHPUT
+BOOT_FROM_POWER_OFF:
+	ld	a,#FE						; Preset #FE, unexpected error
+	out	(PORT_F2),a					; on port #F2
 	if	SMX_ROM = 0
+	ld	hl,WELCOME
+	call	PRINTHL
 	ld	hl,WELCOME_S
 	call	PRINTHL
 	endif
-INIT_NEXT:
 	call	RESET_ESP
 	or	a
-	jp	z,INIT_UNAPI				; Well, if reset succesful, initialize UNAPI
-	; If here, ESP was not found, so, exit with and error message
+	jp	z,INIT_UNAPI				; Well, if reset successful, continue
+ESP_NOT_FOUND:
+	; If here, ESP was not found, so, exit with an error message
 	ld	a,b
 	or	a
 	ld	hl,FAIL_S					; If 0, non responsive
@@ -208,10 +298,13 @@ INIT_NEXT:
 INIT_F_ERRMSG:
 	call	PRINTHL
 INIT_F_WAIT:
-	ld	b,255
+	ld	b,240						; 4s
 INIT_F_LOOP_WAIT:
 	halt
 	djnz	INIT_F_LOOP_WAIT
+AND_DONE:
+	ld	a,#EF						; Set #EF, ESP Not Found
+	out	(PORT_F2),a					; on port #F2
 	ret								; And done
 INIT_UNAPI:
 	ld	a,20
@@ -219,31 +312,51 @@ INIT_UNAPI:
 	ld	a,CMD_QUERY_ACLK_SETTINGS
 	out	(OUT_TX_PORT),a
 	ld	hl,60						; Wait Up To 1s
-	ld	de,(TXTTAB)					; we will borrow Basic Program memory area for now...
+	ld	de,(TXTTAB)					; We will borrow Basic Program memory area for now...
 	ld	ixl,e
-	ld	ixh,d						; address in IX
+	ld	ixh,d						; Address in IX
 	call	WAIT_MENU_CMD_RESPONSE
-	jr	z,INIT_NOCLOCKUPDATE		; if error, just skip
+	jp	z,INIT_NOCLOCKUPDATE		; If error, just skip
 	; Response received, IX+0 and IX+1 has Auto Clock and GMT
 	ld	a,3
 	cp	(ix+0)
-	ret	z							; if disabled, disabled it is, nothing to do
+	jr	nz,INIT_UNAPI2				; If not disabled continue on INIT_UNAPI2
+	; Disabled, ok, so let's ensure connection is not locked (just in case it was setup as disabled right now)
+	ld	a,20
+	out	(OUT_CMD_PORT),a			; Clear UART
+	ld	a,CMD_WIFIRELEASE_ESP
+	out	(OUT_TX_PORT),a				; Just send, no need to wait response
+	ret
+INIT_UNAPI2:
 	ld	a,(#002D)					; Check MSX Version
 	or	a
-	jr	z,INIT_NOCLOCKUPDATE		; If zero, MSX 1, can't set clock
+	jr	z,INIT_NOCLOCKUPDATE		; If zero, MSX1, can't set clock
 	xor	a
 	or	(ix+0)
 	jr	z,INIT_NOCLOCKUPDATE		; if turned off, skip
 	; Ok, not zero, so we are going to simply request the time, it might take up to 10s
 	inc	ix
-	inc	ix							; ok, leave IX+0 and IX+1  intact
+	inc	ix							; ok, leave IX+0 and IX+1 intact
+	; b = number of response check attempts
+	ld	b,5							; 5 * 2s = 10s
 	ld	a,20
 	out	(OUT_CMD_PORT),a			; Clear UART
 	ld	a,CMD_GET_TIME
 	out	(OUT_TX_PORT),a
-	ld	hl,900						; Wait Up To 15s
+TRY_AGAIN:
+	push	bc
+	ld	hl,120						; Wait Up To 2s per attempt
 	call	WAIT_MENU_CMD_RESPONSE
 	jr	nz,INIT_CLOCKUPDATE			; if ok, follow up
+	ld	hl,STR_WAITING				; Print Waiting for connection message
+	call	PRINTHL
+	ld	a,#FF
+	cp	b							; Was time-out the failure reason?
+	pop	bc							; Restore stack ballance and retry counter
+	jr	nz,STOP_TRYING				; If error return code and not time-out, no more checks needed
+	ld	a,CMD_GET_TIME				; Needed for retries
+	djnz	TRY_AGAIN
+STOP_TRYING:
 	; Leave a message that clock has not been updated
 	ld	hl,STR_CLKUPDT_FAIL
 	call	PRINTHL
@@ -255,9 +368,10 @@ WAIT_4S:
 	jr	nz,WAIT_4S
 	jr	INIT_NOCLOCKUPDATE			; error, just skip to not set garbage in clock
 INIT_CLOCKUPDATE:
+	pop	bc
 	dec	ix
 	dec	ix							; ix back where it should
-	; ix + 0 -> 0 If no need to set clock, 1 if set clock, 2 if set clock and request to turn WiFi Off
+	; ix + 0 -> 0 If no need to set clock, 1 if set clock, 2 if set clock and request to turn Wi-Fi Off
 	; ix + 1 -> GMT setting, well, not going to use it
 	; ix + 2 -> Seconds
 	; ix + 3 -> Minutes
@@ -279,13 +393,25 @@ INIT_CLOCKUPDATE:
 	ld	a,2
 	cp	(ix+0)
 	jr	nz,INIT_NOCLOCKUPDATE
-	; If here, turn off Wifi Immediatelly
+	; First, release any hold to Wi-Fi Connection
+	ld	a,20
+	out	(OUT_CMD_PORT),a			; Clear UART
+	ld	a,CMD_WIFIRELEASE_ESP
+	out	(OUT_TX_PORT),a				; Just send, no need to wait response
+	; And, turn off Wi-Fi Immediatelly
 	ld	a,20
 	out	(OUT_CMD_PORT),a			; Clear UART
 	ld	a,CMD_WIFI_OFF
 	out	(OUT_TX_PORT),a				; Just send, no need to wait response
+	jr	INIT_NOCLOCKUPDAT2
 INIT_NOCLOCKUPDATE:
-;--- Save existing EXTBIO hook if it exists
+	; Release any hold to Wi-Fi Connection
+	ld	a,20
+	out	(OUT_CMD_PORT),a			; Clear UART
+	ld	a,CMD_WIFIRELEASE_ESP
+	out	(OUT_TX_PORT),a				; Just send, no need to wait response
+INIT_NOCLOCKUPDAT2:
+	; Save existing EXTBIO hook if it exists
 	ld	a,(HOKVLD)
 	bit	0,a
 	jr	nz,SAVE_HOOK2				; HOKVLD tells us if there is an extended BIOS already or not, if yes, save it
@@ -295,7 +421,7 @@ INIT_NOCLOCKUPDATE:
 	ld	a,#C9						; RET, as we are the first extended BIOS
 	ld	(hl),a
 	jr	PATCH						; And now all we need to do is patch the EXTBIO hook :)
-	
+
 SAVE_HOOK2:
 	; If here, we are not the first to extend bios, so we need to save the previous one
 	call	GETSLT
@@ -305,19 +431,18 @@ SAVE_HOOK2:
 	ld	bc,5						; That is 5 bytes large
 	ldir							; And move to our work area
 	xor	a
-	ld	(de),a						; not initialized (de is at the sixth byte) of our slot work area
+	ld	(de),a						; Not initialized (de is at the sixth byte) of our slot work area
 	inc	de
-	ld	(de),a						; not initialized (de is at the seventh byte) of our slot work area
+	ld	(de),a						; Not initialized (de is at the seventh byte) of our slot work area
 
-;--- Patch EXTBIO
-
+	; Patch EXTBIO
 PATCH:
 	ld	a,#F7						; RST #30
 	ld	(EXTBIO),a					; In EXTBIO hook
 	call	GETSLT					; Our Slot in A
 	ld	(EXTBIO+1),a				; Next EXTBIO hook byte
 	ld	hl,DO_EXTBIO				; Our EXTBIO routine address
-	ld	(EXTBIO+2),hl				; Goes to the followingtwo bytes in the hook
+	ld	(EXTBIO+2),hl				; Goes to the following two bytes in the hook
 
 	ld	hl,EXTBIO+5					; Must patch DISINT and ENAINT as well
 	ld	b,5*2
@@ -333,8 +458,13 @@ INIT_OK:
 	ld	hl,OK_S						; All done and set, nice exit message
 	call	PRINTHL
 	endif
+	ld	a,#F0						; Set #F0, UNAPI driver has been loaded at least once
+	out	(PORT_F2),a					; on port #F2
 	ret
 
+;==============================
+;===  TPA Memory Allocation  ==
+;==============================
 HIMEM_ALLOC:
 	; Now let's reserve memory in the 4th page for our usage
 	ld hl,(HIMEM)					; Get HIMEM
@@ -367,98 +497,195 @@ PATCH_H_TIMI:
 	; Set DNS_READY to zero
 	xor	a
 	call	SETDNSREADY
+	; Set TIME-OUT counter to zero
 	ld	hl,0
 	call	SETCOUNTER
 	ret
 
+;============================
+;===  SETUP Menu Routines  ==
+;===       Main Menu       ==
+;============================
 ESPSETUP.EXIT:
 	ld	a,CLS
 	call	CHPUT
-	jp	INIT_NEXT					; When done, resume initialization
-; Pretty simple setup for the device
+	jp	INIT_UNAPI					; When done, resume initialization
+ENTERING_ESPSETUP:
+	ld	a,#FE						; Preset #FE, unexpected error
+	out	(PORT_F2),a					; on port #F2
+	ld	hl,ENTERING_WIFI_SETUP
+	call	PRINTHL
+	call	WAIT_650MS_AND_THEN_CONTINUE
+	; Hold Wi-Fi Connection On
+	ld	a,20
+	out	(OUT_CMD_PORT),a			; Clear UART
+	ld	a,CMD_WIFIHOLD_ESP
+	out	(OUT_TX_PORT),a
+	ld	hl,60						; Up to 1s time-out
+	call	WAIT_MENU_CMD_RESPONSE	; Wait response
+	; We do not want to error here, just in case user still need to upgrade ESP firmware
 ESPSETUP:
+	call	RESET_ESP
+	or	a
+	jp	nz,ESP_NOT_FOUND			; Not well, ESP was not found
+ESPSETUP_NEXT:
+	call	KILBUF					; Clear Keyboard Buffer
+	; Well, if reset successful, continue
 	in	a,(IN_STS_PORT)
 	bit	3,a							; Quick Receive Supported?
-	jr	z,ESPSETUP.1NF				; If not, no fast receive
+	jr	z,ESPSETUP.1NF				; If not, tells no Quick Receive support
+	ld	hl,WELCOME
+	call	PRINTHL
 	ld	hl,WELCOME_SF
-	jp	ESPSETUP.1F					; Report quick receive supported
+	jp	ESPSETUP.1F					; Report that Quick Receive is supported
 ESPSETUP.1NF:
+	ld	hl,WELCOME
+	call	PRINTHL
 	ld	hl,WELCOME_S
 ESPSETUP.1F:
 	call	PRINTHL					; Print Welcome message
+	ld	a,20
+	out	(OUT_CMD_PORT),a			; Clear UART
+	ld	a,CMD_AP_STS
+	out	(OUT_TX_PORT),a				; Get AP conn status and name
+	ld	hl,60						; Wait Up To 1s
+	ld	de,(TXTTAB)					; We will borrow Basic Program memory area for now...
+	ld	ixl,e
+	ld	ixh,d						; Address in IX
+	call	WAIT_MENU_CMD_RESPONSE
+	jp	z,ESPSETUP.1G				; Won't block in case of error
+	; Success, so connection state is in IX+0, then, zero terminated string with SSID starting at IX+1
+	ld	a,(ix+0)
+	ld	hl,WELCOME_CS0
+	cp	0
+	jr	z,ESPSETUP.2F
+	ld	hl,WELCOME_CS1
+	cp	1
+	jr	z,ESPSETUP.2F
+	ld	hl,WELCOME_CS2
+	cp	2
+	jr	z,ESPSETUP.2F
+	ld	hl,WELCOME_CS3
+	cp	3
+	jr	z,ESPSETUP.2F
+	ld	hl,WELCOME_CS4
+	cp	4
+	jr	z,ESPSETUP.2F
+	ld	hl,WELCOME_CS5
+ESPSETUP.2F:
+	ld	iyh,a						; Save current conn status in iyh
+	call	PRINTHL					; Print Status
+	push	ix
+	pop	hl
+	inc	hl							; HL has AP Name
+	call	PRINTHLINE				; Print AP Name
+	ld	a,CR
+	call	CHPUT
+	ld	a,LF
+	call	CHPUT
+	ld	a,LF
+	call	CHPUT					; Give some space...
+ESPSETUP.1G:
 	ld	hl,MMENU_S
 	call	PRINTHL					; Print Main Menu
-	call	KILBUF					; Clear Keyboard Buffer
+CONN_CHG_LOOP:
+	call	CHSNS
+	jr	nz,MM_WAIT_INPUT			; If not zero, there is a key in buffer
+	; Ok, there is not, we can check if connection status changed
+	ld	a,20
+	out	(OUT_CMD_PORT),a			; Clear UART
+	ld	a,CMD_AP_STS
+	out	(OUT_TX_PORT),a				; Get AP conn status and name
+	ld	hl,60						; Wait Up To 1s
+	ld	de,(TXTTAB)					; We will borrow Basic Program memory area for now...
+	ld	ixl,e
+	ld	ixh,d						; Address in IX
+	call	WAIT_MENU_CMD_RESPONSE
+	jp	z,CONN_CHG_LOOP				; Won't block in case of error
+	ld	a,(ix+0)
+	cp	iyh							; If same, zero
+	jr	z,CONN_CHG_LOOP				; Keep loop
+	jp	ESPSETUP_NEXT				; Changed, re-build menu
 MM_WAIT_INPUT:
 	call	CHGET
 	cp	#1b							; ESC?
 	jp	z,ESPSETUP.EXIT				; When done, resume initialization
 	cp	'1'							; Setup Nagle?
-	jp	z,SET_NAGLE					;
-	cp	'2'							; Setup WiFiOn period?
-	jp	z,SET_WIFI_TIMEOUT			;
+	jp	z,SET_NAGLE
+	cp	'2'							; Setup Wi-Fi On Period?
+	jp	z,SET_WIFI_TIMEOUT
 	cp	'3'							; Scan networks?
-	jp	z,START_WIFI_SCAN			;
+	jp	z,START_WIFI_SCAN
 	cp	'4'							; Automatic Setting of Clock?
-	jp	z,START_CLK_AUTO			;
+	jp	z,START_CLK_AUTO
 	call	BEEP					; Wrong Input, beep
-	jp	MM_WAIT_INPUT				; And return waiting key
+	jp	MM_WAIT_INPUT				; And return, waiting another key
 
+;============================
+;===  SETUP Menu Routines  ==
+;===  Wi-Fi and Clock Menu ==
+;============================
 CLK_MSX1_GO:
 	ld	hl,MMENU_CLOCK_MSX1
-	call	PRINTHL
+	call	PRINTHL					; Print Main Clock MSX1 message
 	call	ISCLKAUTO
 	ld	a,(ix+0)					; Auto Clock Current setting
 	cp	3							; If 3 adapter disabled
-	jr	nz,CLK_MSX1_ADAPTERDIS
-	ld	hl,MMENU_CLOCK_0_MSX1
+	jr	z,CLK_MSX1_ADAPTERDIS
+	ld	hl,MMENU_CLOCK_0
 	call	PRINTHL
-	jr	CLK_MSX1_WAIT_OPT_INPUT
+	jr	CLK_MSX1_OPT
 CLK_MSX1_ADAPTERDIS:
-	ld	hl,MMENU_CLOCK_3_MSX1
+	ld	hl,MMENU_CLOCK_3
+	call	PRINTHL
+CLK_MSX1_OPT:
+	ld	hl,MMENU_CLOCK_OPT
 	call	PRINTHL
 CLK_MSX1_WAIT_OPT_INPUT:
 	call	CHGET
 	cp	#1b							; ESC?
 	jp	z,ESPSETUP					; Back to main menu
-	cp	'0'							;
-	jp	z,CLK_MSX1_SEND_CMD			;
-	cp	'3'							;
-	jp	z,CLK_AUTO_WAIT_GMT			;
+	cp	'0'
+	jp	z,CLK_MSX1_SEND_CMD
+	cp	'3'
+	jp	z,CLK_AUTO_WAIT_GMT
 	call	BEEP					; Wrong Input, beep
-	jp	CLK_MSX1_WAIT_OPT_INPUT		; Back to main menu
+	jp	CLK_MSX1_WAIT_OPT_INPUT		; And return, waiting another key
 CLK_MSX1_SEND_CMD:
 	call	CHPUT					; Print option
-	sub	'0'							; correct format
+	sub	'0'							; Adjust format
 	ld	(ix+0),a					; Save it
-	ld	a,#D
-	call CHPUT
-	ld	a,#A
-	call CHPUT
-	jp	CLK_AUTO_GMT_CHK_DONE		; and sending the command will be done there
+	ld	a,#0d
+	call	CHPUT
+	ld	a,#0a
+	call	CHPUT
+	jp	CLK_AUTO_GMT_CHK_DONE		; And sending the command will be done there
 
 START_CLK_AUTO:
+	ld	a,'4'
+	call	CHPUT
+	call	WAIT_250MS_AND_THEN_CONTINUE
 	ld	a,(#002D)					; Check MSX Version
 	or	a
-	jp	z,CLK_MSX1_GO				; If zero, MSX 1, so can just enable or disable adapter
+	jp	z,CLK_MSX1_GO				; If zero, MSX1, so can just enable or disable adapter
 CLK_AUTO_GO:
 	ld	hl,MMENU_CLOCK_MSX2
-	call	PRINTHL
+	call	PRINTHL					; Print Main Clock MSX2 message
 	call	ISCLKAUTO
 	ld	a,(ix+0)					; Auto Clock Current setting
 	or	a							; If zero, off
 	jr	nz,CLK_AUTO_CHK1
 	ld	hl,MMENU_CLOCK_0
 	call	PRINTHL
-	jr	CLK_AUTO_GMT
+	jr	CLK_AUTO_GMT_OPT
 CLK_AUTO_CHK1:
-	dec	a							; if 1, on and keep wifi on
+	dec	a							; If 1, on and keep wifi on
 	jr	nz,CLK_AUTO_CHK2
 	ld	hl,MMENU_CLOCK_1
 	call	PRINTHL
 	jr	CLK_AUTO_GMT
 CLK_AUTO_CHK2:
-	dec	a							; if 2, on and turn wifi off
+	dec	a							; If 2, on and turn wifi off
 	jr	nz,CLK_AUTO_3
 	ld	hl,MMENU_CLOCK_2
 	call	PRINTHL
@@ -466,6 +693,7 @@ CLK_AUTO_CHK2:
 CLK_AUTO_3:
 	ld	hl,MMENU_CLOCK_3
 	call	PRINTHL
+	jr	CLK_AUTO_GMT_OPT
 CLK_AUTO_GMT:
 	ld	h,(ix+1)					; Save it for now
 	ld	a,(ix+1)					; GMT current setting
@@ -473,15 +701,19 @@ CLK_AUTO_GMT:
 	jr	z,CLK_AUTO_GMTP
 	ld	a,'-'
 	call	CHPUT
-	res	7,(ix+1)					; clear - indicator
+	res	7,(ix+1)					; Clear - indicator
+	jr	CLK_AUTO_GMTM
 CLK_AUTO_GMTP:
+	ld	a,'+'
+	call	CHPUT
+CLK_AUTO_GMTM:
 	ld	a,9
 	cp	(ix+1)						; Greater than 9?
-	jr	nc,CLK_AUTO_GMTD			; if not, just print what is in A + '0'
-	ld	a,'1'						; it is 1
+	jr	nc,CLK_AUTO_GMTD			; If not, just print what is in A + '0'
+	ld	a,'1'						; It is 1
 	call	CHPUT
 	ld	a,(ix+1)
-	add	'0'-10						; need to subtract 10 and add '0' to print
+	add	'0'-10						; Need to subtract 10 and add '0' to print
 	call	CHPUT
 	jr	CLK_AUTO_GMT_OPT
 CLK_AUTO_GMTD:
@@ -496,64 +728,64 @@ CLK_AUTO_WAIT_OPT_INPUT:
 	call	CHGET
 	cp	#1b							; ESC?
 	jp	z,ESPSETUP					; Back to main menu
-	cp	'0'							;
-	jp	z,CLK_AUTO_WAIT_GMT			;
-	cp	'1'							;
-	jp	z,CLK_AUTO_WAIT_GMT			;
-	cp	'2'							;
-	jp	z,CLK_AUTO_WAIT_GMT			;
-	cp	'3'							;
-	jp	z,CLK_AUTO_WAIT_GMT			;
+	cp	'0'
+	jp	z,CLK_AUTO_WAIT_GMT
+	cp	'1'
+	jp	z,CLK_AUTO_WAIT_GMT
+	cp	'2'
+	jp	z,CLK_AUTO_WAIT_GMT
+	cp	'3'
+	jp	z,CLK_AUTO_WAIT_GMT
 	call	BEEP					; Wrong Input, beep
-	jp	CLK_AUTO_WAIT_OPT_INPUT		; Back to main menu
+	jp	CLK_AUTO_WAIT_OPT_INPUT		; And return, waiting another key
 CLK_AUTO_WAIT_GMT:
 	call	CHPUT					; Print option
-	sub	'0'							; correct format
+	sub	'0'							; Adjust format
 	ld	(ix+0),a					; Save it
 	or	a
-	jp	z,CLK_AUTO_GMT_CHK_DONE		; and sending the command if just disabling clock auto set
+	jp	z,CLK_AUTO_GMT_CHK_DONE		; And send the command if just disabling clock auto set
 	cp	3
-	jp	z,CLK_AUTO_GMT_CHK_DONE		; and sending the command if just disabling the adapter
+	jp	z,CLK_AUTO_GMT_CHK_DONE		; Or send the command if just disabling the adapter
 	ld	hl,MMENU_GMT_OPT
 	call	PRINTHL
-	ld	d,0							; digits entered
-	ld	e,0							; characters printed
+	ld	d,0							; # of digits entered
+	ld	e,0							; # of characters printed
 	ld	(ix+1),0					; GMT 0
 CLK_AUTO_WAIT_GMT_INPUT:
 	call	CHGET
 	cp	#1b							; ESC?
 	jp	z,ESPSETUP					; Back to main menu
-	cp	13							; Enter?
+	cp	#0d							; ENTER?
 	jp	z,CLK_AUTO_GMT_CHK_INPUT	; Check if ok to send command
 	cp	#08							; Backspace?
 	jp	z,CLK_AUTO_GMT_CHK_BS		; Check if there is something to erase
 	cp	'-'							; Negative value?
-	jp	z,CLK_AUTO_GMT_CHK_INPUT	;
+	jp	z,CLK_AUTO_GMT_CHK_INPUT
 	cp	'0'							; >=0?
 	jp	c,CLK_AUTO_GMT_BAD_INPUT	; If not, bad input
 	cp	'9'+1						; <= 9
 	jp	nc,CLK_AUTO_GMT_BAD_INPUT	; If not, bad input
-	jp	CLK_AUTO_GMT_CHK_INPUT		; otherwise, validate digit
+	jp	CLK_AUTO_GMT_CHK_INPUT		; Otherwise, validate digit
 CLK_AUTO_GMT_CHK_BS:
 	xor	a
-	cp	e							; anything on screen?
+	cp	e							; Anything on screen?
 	jr	z,CLK_AUTO_GMT_BAD_INPUT	; Nothing to erase
-	dec	e							; one less character on the screen
+	dec	e							; One less character on the screen
 	cp	d							; Any digit?
-	jr	z,CLK_AUTO_GMT_CHK_BS_MIN	; if not, just erase - sign
+	jr	z,CLK_AUTO_GMT_CHK_BS_MIN	; If not, just erase - sign
 	; There is, so it is one less digit
 	dec	d
 	jr	CLK_AUTO_GMT_CHK_DIGIT
 CLK_AUTO_GMT_CHK_BS_MIN:
-	ld	(ix+1),0					; reset sign
+	ld	(ix+1),0					; Reset sign
 CLK_AUTO_GMT_CHK_DIGIT:
-	ld	a,8							; backspace
-	call	CHPUT					; print it
-	ld	a,' '						; space
-	call	CHPUT					; print it
-	ld	a,8							; backspace
-	call	CHPUT					; print it
-	jp	CLK_AUTO_WAIT_GMT_INPUT		; return
+	ld	a,8							; Backspace
+	call	CHPUT					; Print it
+	ld	a,' '						; Space
+	call	CHPUT					; Print it
+	ld	a,8							; Backspace
+	call	CHPUT					; Print it
+	jp	CLK_AUTO_WAIT_GMT_INPUT		; Return
 CLK_AUTO_GMT_BAD_INPUT:
 	; Beep might use sub rom, and if so, all registers will be messed up, better save
 	push	bc
@@ -565,7 +797,7 @@ CLK_AUTO_GMT_BAD_INPUT:
 	pop	af
 	pop	de
 	pop bc
-	jp	CLK_AUTO_WAIT_GMT_INPUT		; Continue waiting input
+	jp	CLK_AUTO_WAIT_GMT_INPUT		; And return, waiting another key
 CLK_AUTO_GMT_CHK_INPUT:
 	ld	c,a							; Save in C for printing if needed
 	cp	'-'							; - sign?
@@ -578,19 +810,19 @@ CLK_AUTO_GMT_CHK_INPUT:
 	ld	a,c
 	call	CHPUT
 	ld	(ix+1),0x80					; Set the - sign bit, for now rest is zero
-	inc	e							; increase characters printed
+	inc	e							; Increase # of characters printed
 	jp	CLK_AUTO_WAIT_GMT_INPUT		; Continue waiting input
 CLK_AUTO_GMT_CHK_CR:
-	cp	13							; Enter?
+	cp	#0d							; ENTER?
 	jr	nz,CLK_AUTO_GMT_CHK_CD		; If not, check if digit is valid
 	; Enter
 	ld	a,0
 	cp	d							; Ok, at least one digit entered?
 	jr	z,CLK_AUTO_GMT_BAD_INPUT	; No, so, enter is no good now
-	; It is, so, if it had a digit entered and did not send, it was 1, so...
+	; It is, if it had a digit entered and did not send, it was 1, so...
 	ld	a,1
-	or	a,(ix+1)					; adjust sign, if needed
-	ld	(ix+1),a					; save
+	or	a,(ix+1)					; Adjust sign, if needed
+	ld	(ix+1),a					; Save
 	jr	CLK_AUTO_GMT_CHK_DONE		; Ok, ready to send
 CLK_AUTO_GMT_CHK_CD:
 	; Ok, it is a digit
@@ -599,26 +831,26 @@ CLK_AUTO_GMT_CHK_CD:
 	ld	b,a							; Save in B
 	ld	a,0
 	cp	d
-	jr	nz,CLK_AUTO_GMT_CHK_CSD		; if not zero, it is second digit, so almost done
+	jr	nz,CLK_AUTO_GMT_CHK_CSD		; If not zero, it is second digit, so almost done
 	; 1st digit, let's check if it is other than 1, if it is, we are almost done
 	ld	a,1
 	cp	b
-	jr	z,CLK_AUTO_GMT_CHK_CD.1		; if it is 1, wait next digit or enter
-	; not 1, so just adjust ix+1 and go
+	jr	z,CLK_AUTO_GMT_CHK_CD.1		; If it is 1, wait next digit or enter
+	; Not 1, so just adjust ix+1 and go
 	ld	a,c
 	call	CHPUT					; Print it
 	ld	a,b
 	or	a
 	jr	z,CLK_AUTO_SKIP_SIGN
-	or	a,(ix+1)					; adjust sign, if needed
+	or	a,(ix+1)					; Adjust sign, if needed
 CLK_AUTO_SKIP_SIGN:
-	ld	(ix+1),a					; save
+	ld	(ix+1),a					; Save
 	jr	CLK_AUTO_GMT_CHK_DONE		; Ok, ready to send
 CLK_AUTO_GMT_CHK_CD.1:
 	ld	a,c
 	call	CHPUT					; Print it
-	inc	d							; digits entered now is 1
-	inc	e							; digits printed increased
+	inc	d							; Digits entered now is 1
+	inc	e							; Digits printed increased
 	jp	CLK_AUTO_WAIT_GMT_INPUT		; Continue waiting input
 CLK_AUTO_GMT_CHK_CSD:
 	; Second digit, easy... First was 1, now need to check if it is 0, 1 or 2, otherwise, bad entry
@@ -626,37 +858,37 @@ CLK_AUTO_GMT_CHK_CSD:
 	ld	b,3
 	cp	b
 	jp	nc,CLK_AUTO_GMT_BAD_INPUT	; 3 or more, so, not valid
-	or	a							; is it zero?
-	jr	nz,CLK_AUTO_GMT_CHK_CSD1	; if not, check for 1
-	; it was zero
-	ld	a,10						; so, 10
-	or	a,(ix+1)					; adjust sign, if needed
-	ld	(ix+1),a					; save
+	or	a							; Is it zero?
+	jr	nz,CLK_AUTO_GMT_CHK_CSD1	; If not, check for 1
+	; It was zero
+	ld	a,10						; So, 10
+	or	a,(ix+1)					; Adjust sign, if needed
+	ld	(ix+1),a					; Save
 	ld	a,c
-	call	CHPUT					; print it
-	jr	CLK_AUTO_GMT_CHK_DONE		; ready to
+	call	CHPUT					; Print it
+	jr	CLK_AUTO_GMT_CHK_DONE		; Ready to
 CLK_AUTO_GMT_CHK_CSD1:
-	dec	a							; is it one?
+	dec	a							; Is it one?
 	jr	nz,CLK_AUTO_GMT_CHK_CSD2
-	; it was one
-	ld	a,11						; so, eleven
-	or	a,(ix+1)					; adjust sign, if needed
-	ld	(ix+1),a					; save
+	; It was one
+	ld	a,11						; So, eleven
+	or	a,(ix+1)					; Adjust sign, if needed
+	ld	(ix+1),a					; Save
 	ld	a,c
-	call	CHPUT					; print it
-	jr	CLK_AUTO_GMT_CHK_DONE		; ready to send
+	call	CHPUT					; Print it
+	jr	CLK_AUTO_GMT_CHK_DONE		; Ready to send
 CLK_AUTO_GMT_CHK_CSD2:
-	; it was two
-	ld	a,12						; so, twelve
-	or	a,(ix+1)					; adjust sign, if needed
-	ld	(ix+1),a					; save
+	; It was two
+	ld	a,12						; So, twelve
+	or	a,(ix+1)					; Adjust sign, if needed
+	ld	(ix+1),a					; Save
 	ld	a,c
-	call	CHPUT					; print it
-	; and send command
+	call	CHPUT					; Print it
+	; And send command
 CLK_AUTO_GMT_CHK_DONE:
-	ld	a,#D
+	ld	a,#0d
 	call	CHPUT
-	ld	a,#A
+	ld	a,#0a
 	call	CHPUT
 	ld	hl,STR_SENDING
 	call	PRINTHL
@@ -682,14 +914,22 @@ CLK_AUTO_GMT_CHK_RESULT:
 	call	PRINTHL
 	jp	WAIT_2S_AND_THEN_MAINMENU
 
+;============================
+;===  SETUP Menu Routines  ==
+;===    Wi-Fi Scan Menu    ==
+;============================
 START_WIFI_SCAN:
-	ld hl,MMENU_SCAN
+	ld	a,'3'
+	call	CHPUT
+	call	WAIT_250MS_AND_THEN_CONTINUE
+START_WIFI_RESCAN:
+	ld	hl,MMENU_SCAN
 	call	PRINTHL					; Print Main Scan message
-	call	STARTWIFISCAN			; Request WiFi Scan to start
-	ld	de,(TXTTAB)					; we will borrow Basic Program memory area for now...
+	call	STARTWIFISCAN			; Request Wi-Fi Scan to start
+	ld	de,(TXTTAB)					; We will borrow Basic Program memory area for now...
 	ld	ixl,e
-	ld	ixh,d						; address in IX
-	ld	de,20						; at least 10s waiting scan to finish, retry 20 times waiting 0.5s between attempts
+	ld	ixh,d						; Address in IX
+	ld	de,20						; At least 10s waiting scan to finish, retry 20 times waiting 0.5s between attempts
 WIFI_SCAN_WAIT_END:
 	ld	a,20
 	out	(OUT_CMD_PORT),a			; Clear UART
@@ -713,51 +953,84 @@ WIFI_SCAN_WAITHS:
 	jp	WIFI_SCAN_WAIT_END
 WIFI_SCAN_SHOW_LIST:
 	ld	d,a							; Save access point counter here
-	ld	e,0							; and here how many were printed
+	ld	e,0							; And here how many were printed
 	ld	hl,MMENU_SCANS
 	call	PRINTHL
 	push	ix
 	pop	hl							; IX in HL
 WIFI_LIST_LOOP:
 	ld	a,e
-	add	a,'0'						; convert in number
+	add	a,'0'						; Convert to number
 	call	CHPUT
-	ld	a,'-'
+	ld	a,' '						; Space
 	call	CHPUT
-	ld	a,' '
+	ld	a,'-'						; Dash
 	call	CHPUT
+	ld	a,' '						; Space
+	call	CHPUT
+	ld	b,24						; Cuts AP names > 23 chars
 PRT_APNAMELP:
 	ld	a,(hl)
 	or	a
 	jp	z,PRT_APENC
 	call	CHPUT
 	inc	hl
-	jp	PRT_APNAMELP
+	djnz	PRT_APNAMELP
+	push	hl
+	ld	hl,SCAN_TERMINATOR_CUT
+	call	PRINTHL
+	pop	hl
+PRT_APNAMELP_CUT:
+	ld	a,(hl)
+	or	a
+	jp	z,PRT_APENC
+	inc	hl
+	jp	PRT_APNAMELP_CUT
 PRT_APENC:
 	inc	hl
 	ld	a,(hl)
 	or	a
 	jp	z,PRT_APNOTENC
-	ld	bc,SCAN_TERMINATOR_ENC
-	call	PRINTBC
+	push	hl
+	ld	hl,SCAN_TERMINATOR_ENC
+	call	PRINTHL
+	pop	hl
 	jp	PRT_AP_CHKLOOP
 PRT_APNOTENC:
-	ld	bc,SCAN_TERMINATOR_OPEN
-	call	PRINTBC
+	push	hl
+	ld	hl,SCAN_TERMINATOR_OPEN
+	call	PRINTHL
+	pop	hl
 PRT_AP_CHKLOOP:
 	inc	hl
 	inc	e
-	ld	a,10
+	ld	a,SCAN_MAX_PAGE_SIZE
 	cp	e
 	jp	z,APLIST_OVERFLOW
 	dec	d
 	jp	nz,WIFI_LIST_LOOP
+	ld	b,0							; Signal no more list data
+	jr	APLIST_NO_OVERFLOW
 APLIST_OVERFLOW:
-	; if here, whole list has been printed
+	dec	d							; Update remaining itens
+	xor	a
+	or	d							; Still has itens?
+	jr	z,APLIST_NO_OVERFLOW		; No more itens
+	ld	b,1							; Signal that there still is data pending to list in another page
+	push	hl
+	pop	iy							; Save in IY the address to continue from
+	ld	c,d							; And C has the remaining AP count
+	ld	hl,MMENU_SCANQM
+	jr	APLIST_NOFLW
+APLIST_NO_OVERFLOW:
+	; If here, current page has been printed
 	; E has the maximum allowable AP number
+	; B will indicate if there are more itens for a next page
+	; IY will hold the address of the following itens
 	; Let's ask which one to connect
 	ld	hl,MMENU_SCANQ
-	call	PRINTHL					; Show message which network to connect
+APLIST_NOFLW:
+	call	PRINTHL					; Show message asking which network to connect
 	ld	a,'0'
 	add	a,e
 	ld	e,a							; To make it easy in the selection screen
@@ -765,20 +1038,111 @@ WIFI_SELECT_AP:
 	call	CHGET
 	cp	#1b							; ESC?
 	jp	z,ESPSETUP					; When done, back to main setup
-	cp	'0'							; check if A is less than 0
-	jp	c,INPUT_WFSAP_BAD_INPUT		; if it is, ignore
-	cp	e							; check if a is greater than what is in E
-	jp	nc,INPUT_WFSAP_BAD_INPUT	; if it is, ignore
+	cp	#20							; Spacebar?
+	jp	z,WIFI_SELECT_SPACEBAR		; Check if re-scan or next page
+	cp	CR							; ENTER?
+	jp	z,WIFI_CONNECT_ME_CHOOSEN	; Request AP Name and Password if needed
+	cp	'0'							; Check if A is less than 0
+	jp	c,INPUT_WFSAP_BAD_INPUT		; If it is, ignore
+	cp	e							; Check if a is greater than what is in E
+	jp	nc,INPUT_WFSAP_BAD_INPUT	; If it is, ignore
+	jp	WIFI_CONNECT_SELECTION_OK	; Selection Ok if here
+
+WIFI_SELECT_SPACEBAR:
+	xor	a
+	or	b
+	jp	z,START_WIFI_RESCAN			; Rescan if no more itens
+	; Otherwise, more itens, start at IY
+	push	iy
+	pop	ix							; Restore the list from where we finished last time
+	ld	a,c							; Restore the remaining APs to list
+	jp	WIFI_SCAN_SHOW_LIST			; And show
+
+WIFI_CONNECT_ME_CHOOSEN:
+	ld	hl,MMENU_MANUALENTRY
+	call	PRINTHL					; Show message asking AP details....
+	; IX has the AP list, we don't care, but that address is ours to use to handle SSID Entry
+	push	ix
+	pop	hl							; HL has the address
+	ld	c,0							; AP name size
+WIFI_CONNECT_MANUAL_ENTRY:
+	call	CHGET
+	cp	#1b							; ESC?
+	jp	z,ESPSETUP					; Back to main setup
+	cp	#08							; Backspace?
+	jr	z,WIFI_CONNECT_ME_BS		; Check if there is something to erase
+	cp	#0d							; ENTER?
+	jr	z,WIFI_ME_CHECK_INPUT		; Check if ok
+	; Otherwise it is a digit
+	ld	(hl),a
+	inc	c
+	inc hl
+	cp	32
+	jr	nc,WIFI_CONNECT_ME_CHKPRT2	; Ok, not below space, but is it delete?
+	ld	a,'?'						; Prints a question mark
+	jr	WIFI_CONNECT_ME_CHKPRTD
+WIFI_CONNECT_ME_CHKPRT2:
+	cp	#7f
+	jr	nz,WIFI_CONNECT_ME_CHKPRTD
+	ld	a,'?'						; Prints a question mark if it is delete
+WIFI_CONNECT_ME_CHKPRTD:
+	call	CHPUT					; Print a char
+	ld	a,32						; SSID maximum is 32 characters
+	cp	c							; Have we hit it?
+	jr	nz,WIFI_CONNECT_MANUAL_ENTRY; No, just continue waiting characters
+	; Hit the limit or Enter when C not zero
+WIFI_CONNECT_ME_0_TERM:
+	xor	a
+	ld	(hl),a
+	inc	hl
+	push	hl						; Save it
+	ld	hl,MENU_MANUALENTRY_PWD
+	call	PRINTHL					; We are asking if password is needed
+	pop	hl							; Restore it
+	call	CHGET					; Get key, if Y or y, needed, otherwise not
+	call	CHPUT					; Print what was typed
+	res	5,a							; Force upper case
+	cp	'Y'
+	ld	a,1							; Do not change flags, pwd needed
+	jr	z,WIFI_CONNECT_ME_PWD		; And tell using encryption
+	xor	a							; Ok, if here, no pwd, so no encryption
+WIFI_CONNECT_ME_PWD:
+	ld	(hl),a						; Save if encryption is expected
+	push	ix
+	pop	hl							; HL containing the beginning of SSID name
+	jp	WIFI_CONNECT_AP_PWDQ		; And the rest is handled like if menu selected
+WIFI_CONNECT_ME_BS:
+	xor	a
+	cp	c							; Has any data to delete?
+	jr	z,WIFI_CONNECT_MANUAL_ENTRY	; No
+	; Yes
+	dec	hl							; Decrement pointer
+	dec	c							; Decrement counter
+	ld	a,8							; Backspace
+	call	CHPUT					; Print it
+	ld	a,' '						; Space
+	call	CHPUT					; Print it
+	ld	a,8							; Backspace
+	call	CHPUT					; Print it
+	jr	WIFI_CONNECT_MANUAL_ENTRY	; Return
+WIFI_ME_CHECK_INPUT:
+	xor	a
+	cp	c							; Has received any data?
+	jr	z,WIFI_CONNECT_MANUAL_ENTRY	; No
+	jp	WIFI_CONNECT_ME_0_TERM		; Yes, so handle SSID input termination
+
+WIFI_CONNECT_SELECTION_OK:
 	call	CHPUT					; Valid input, print it
 	ld	e,'0'
 	sub	a,e							; Get in decimal
-	ld	e,a							; back in E
-	;	IX has the AP list, A which one has been selected, now our routine will do it
-	ld	hl,MMENU_CONNECTING
-	call	PRINTHL
-	; put IX in HL
+	ld	e,a							; Back in E
+	; IX has the AP list, A which one has been selected, now our routine will do it
+	ld	a,#0d
+	call	CHPUT
+	ld	a,#0a
+	call	CHPUT
 	push	ix
-	pop	hl
+	pop	hl							; put IX in HL
 WIFI_CONNECT_AP_SRCH:
 	ld	a,e
 	or	a
@@ -790,7 +1154,7 @@ WIFI_CONNECT_AP_SRCH.1:
 	jp	nz,WIFI_CONNECT_AP_SRCH.1	; Find string terminator
 	; Found, jump encryption byte
 	inc	hl
-	dec	e							; decrement selection, if 0 we are done
+	dec	e							; Decrement selection, if 0 we are done
 	jp	nz,WIFI_CONNECT_AP_SRCH.1
 WIFI_CONNECT_AP_PWDQ:
 	; HL has the address of AP name string
@@ -803,17 +1167,17 @@ WIFI_CONNECT_APSIZE:
 	inc	de
 	or	a
 	jp	nz,WIFI_CONNECT_APSIZE		; Count size, including zero terminator
-	; check for encryption
+	; Check for encryption
 	ld	a,(de)
 	or	a
-	jr	z,WIFI_CONNECT_SENDCMD		; If no password requested, good to go
+	jp	z,WIFI_CONNECT_SENDCMD		; If no password requested, good to go
 	; Shoot, need to request password, well, let's do it
 	push	hl						; Save HL
 	ld	hl,MMENU_ASKPWD
 	call	PRINTHL					; Inform that user need to input PWD
-	pop	hl							; restore HL
-	ld	iy,0						; iy will help in backspacing
-	ld	ixh,0						; Start not hidden
+	pop	hl							; Restore HL
+	ld	iy,0						; IY will help in backspacing
+	ld	ixh,1						; Start hidden
 WIFI_CONNECT_RCV_PWD:
 	call	CHGET
 	cp	#1b							; ESC?
@@ -822,62 +1186,85 @@ WIFI_CONNECT_RCV_PWD:
 	jp	z,WIFI_CONNECT_RCV_PWD_BS	; Check if there is something to erase
 	cp	#0d							; ENTER?
 	jp	z,WIFI_PWD_CHECK_INPUT		; Check if ok
-	cp	#7f							; delete?
+	cp	#7f							; Delete?
 	jp	z,WIFI_CONNECT_RCV_PWDH		; Change password from clear to hidden or vice versa
+WIFI_CONNECT_RCV_PWD_STR:
 	; Ok, so it is a digit and store
 	ld	(de),a
+	ld	a,iyl
+	sub	63							; 63 chars password limit (WPA2 encryption)
+	jr	z,WIFI_CONNECT_RCV_PWD
+	ld	a,(de)
 	inc	bc
 	inc	de
 	inc	iy							; Increment counters and pointer
-	push	af						; save A
+	push	af						; Save A
 	ld	a,ixh
-	or	a							; if zero, print char, otherwise print *
+	or	a							; If zero, print char, otherwise print *
 	jr	z,WIFI_CONNECT_RCV_PWD_CHAR
 	pop	af
-	ld	a,'*'						; Otherwise print * and keep password hidden
-	call	CHPUT					; Print an *
-	jp	WIFI_CONNECT_RCV_PWD		; and back to receiving digits
+	ld	a,'*'						; Print * and keep password hidden
+	call	CHPUT
+	jp	WIFI_CONNECT_RCV_PWD		; And back to receiving digits
 WIFI_CONNECT_RCV_PWD_CHAR:
 	pop	af
-	call	CHPUT					; Print an *
-	jp	WIFI_CONNECT_RCV_PWD		; and back to receiving digits
+	cp	32
+	jr	nc,WIFI_CONNECT_RCV_CHKPRT2	; Ok, not below space, but is it delete?
+	ld	a,'?'						; Prints a question mark
+	jr	WIFI_CONNECT_RCV_CHKPRTD
+WIFI_CONNECT_RCV_CHKPRT2:
+	cp	#7f
+	jr	nz,WIFI_CONNECT_RCV_CHKPRTD
+	ld	a,'?'						; Prints a question mark if it is delete
+WIFI_CONNECT_RCV_CHKPRTD:
+	call	CHPUT					; Print a char
+	jp	WIFI_CONNECT_RCV_PWD		; And back to receiving digits
 
 WIFI_CONNECT_RCV_PWDH:
 	ld	a,iyl
 	or	iyh
-	jp	nz,WIFI_CONNECT_RCV_PWD		; if digits entered, can't change password behavior
+	jp	nz,WIFI_CONNECT_RCV_PWD_STR	; If digits entered, can't change password behavior, so it is a pass phrase char
 	xor	a
 	or	ixh
 	ld	ixh,1
-	jr	z,WIFI_CONNECT_RCV_PWD		; return if it was 0
+	jr	z,WIFI_CONNECT_RCV_PWD		; Return if it was 0
 	ld	ixh,0
-	jr	z,WIFI_CONNECT_RCV_PWD		; otherwise set to 0 and return
+	jr	z,WIFI_CONNECT_RCV_PWD		; Otherwise set to 0 and return
 
 WIFI_CONNECT_RCV_PWD_BS:
 	ld	a,iyl
 	or	iyh
-	jp	z,WIFI_CONNECT_RCV_PWD		; if no digits entered, nothing to erase
-	dec	iy							; decrement counter
-	dec	bc							; decrement counter
-	dec	de							; decrement pointer
-	ld	a,8							; backspace
-	call	CHPUT					; print it
-	ld	a,' '						; space
-	call	CHPUT					; print it
-	ld	a,8							; backspace
-	call	CHPUT					; print it
-	jp	WIFI_CONNECT_RCV_PWD		; return
+	jp	z,WIFI_CONNECT_RCV_PWD		; If no digits entered, nothing to erase
+	dec	iy							; Decrement counter
+	dec	bc							; Decrement counter
+	dec	de							; Decrement pointer
+	ld	a,8							; Backspace
+	call	CHPUT					; Print it
+	ld	a,' '						; Space
+	call	CHPUT					; Print it
+	ld	a,8							; Backspace
+	call	CHPUT					; Print it
+	jp	WIFI_CONNECT_RCV_PWD		; Return
 
 WIFI_PWD_CHECK_INPUT:
 	ld	a,iyl
 	or	iyh
-	jp	z,WIFI_CONNECT_RCV_PWD		; if no digits entered, no password to send
-	; otherwise done and ready to send
-
+	jp	z,WIFI_CONNECT_RCV_PWD		; If no digits entered, no password to send
+	; Otherwise done and ready to send
 WIFI_CONNECT_SENDCMD:
-	ld	a,#D
+	call	WAIT_250MS_AND_THEN_CONTINUE
+	push	hl
+	ld	HL,MMENU_CONNECTING
+	call	PRINTHL
+	pop	hl
+	; Print AP name
+	push	hl
+	call	PRINTHL
+	pop	hl
+	ld	a,CR
 	call	CHPUT
-	ld	a,#A
+	ld	a,LF
+	call	CHPUT
 	call	CHPUT
 	; HL has the address of our data, BC the data size, so it is just needed to send the command
 	ld	a,20
@@ -913,12 +1300,16 @@ INPUT_WFSAP_BAD_INPUT:
 	push	de
 	push	af
 	push	hl
+	push	ix
+	push	iy
 	call	BEEP					; Wrong Input, beep
+	pop	iy
+	pop	ix
 	pop	hl
 	pop	af
 	pop	de
 	pop bc
-	jp WIFI_SELECT_AP				; return
+	jp WIFI_SELECT_AP				; Return
 
 WIFI_SCAN_NONETWORKS:
 	ld	hl,MMENU_SCANN
@@ -931,11 +1322,14 @@ WIFI_SCAN_TIMEOUT:
 	jp	WAIT_4S_AND_THEN_MAINMENU
 
 SET_WIFI_TIMEOUT:
-	ld hl,MMENU_TIMEOUT
-	call	PRINTHL					; Print Main Nagle message
+	ld	a,'2'
+	call	CHPUT
+	call	WAIT_250MS_AND_THEN_CONTINUE
+	ld	hl,MMENU_TIMEOUT
+	call	PRINTHL					; Print Main Timeout message
 	call	CHECKTIMEOUT			; TimeOut is on or off?
-	jp	z,WIFI_SET_ALWAYS_ON		; if 0, always ON
-	; otherwise there is a timeout
+	jp	z,WIFI_SET_ALWAYS_ON		; If 0, always on
+	; Otherwise there is a timeout
 	push	hl
 	ld hl,MMENU_TIMEOUT_NOTALWAYSON1
 	call	PRINTHL
@@ -943,15 +1337,15 @@ SET_WIFI_TIMEOUT:
 	call	PRINTHL
 	ld hl,MMENU_TIMEOUT_NOTALWAYSON2
 	call	PRINTHL
-	ld	d,0							; count digits
+	ld	d,0							; Count digits
 	jr	INPUT_TIMEOUT
 WIFI_SET_ALWAYS_ON:
 	ld	hl,MMENU_TIMEOUT_ALWAYSON
 	call	PRINTHL
-	ld	de,(TXTTAB)					; we will borrow Basic Program memory area for now...
+	ld	de,(TXTTAB)					; We will borrow Basic Program memory area for now...
 	ld	ixl,e
-	ld	ixh,d						; address in IX
-	ld	d,0							; count digits
+	ld	ixh,d						; Address in IX
+	ld	d,0							; Count digits
 INPUT_TIMEOUT:
 	call	CHGET
 	cp	#1b							; ESC?
@@ -960,52 +1354,52 @@ INPUT_TIMEOUT:
 	jp	z,SET_WIFI_CHECK_INPUT		; Check if ok
 	cp	#08							; Backspace?
 	jp	z,SET_WIFI_BS_INPUT			; Check if there is something to erase
-	cp	'0'							; check if A is less than 0
+	cp	'0'							; Check if A is less than 0
 	jp	c,INPUT_TIMEOUT_BAD_INPUT	; if it is, ignore
-	cp	'9'+1						; check if a is greater than  9
-	jp	nc,INPUT_TIMEOUT_BAD_INPUT	; if it is, ignore
-	ld	(ix+0),a					; save it
-	call	CHPUT					; it is valid, so print it
-	inc	d							; increment digit count
-	inc	ix							; increment pointer
+	cp	'9'+1						; Check if a is greater than  9
+	jp	nc,INPUT_TIMEOUT_BAD_INPUT	; If it is, ignore
+	ld	(ix+0),a					; Save it
+	call	CHPUT					; It is valid, so print it
+	inc	d							; Increment digit count
+	inc	ix							; Increment pointer
 	ld	a,3
 	cp	d
 	jp	z,SET_WIFI_CHECK_INPUT		; All we can do is accept up to 3 digits, check if ok
-	jp	INPUT_TIMEOUT				; not done yet, so continue
+	jp	INPUT_TIMEOUT				; Not done yet, so continue
 
 INPUT_TIMEOUT_BAD_INPUT:
 	call	BEEP					; Wrong Input, beep
-	jp INPUT_TIMEOUT				; return
+	jp INPUT_TIMEOUT				; Return
 
 SET_WIFI_BS_INPUT:
 	xor	a
-	or	d							; counter has any digit?
-	jp	z,INPUT_TIMEOUT				; nope, so just continue
-	dec	d							; decrement counter
-	dec	ix							; decrement pointer
-	ld	a,8							; backspace
-	call	CHPUT					; print it
-	ld	a,' '						; space
-	call	CHPUT					; print it
-	ld	a,8							; backspace
-	call	CHPUT					; print it
-	jp	INPUT_TIMEOUT				; return
+	or	d							; Counter has any digit?
+	jp	z,INPUT_TIMEOUT				; Nope, so just continue
+	dec	d							; Decrement counter
+	dec	ix							; Decrement pointer
+	ld	a,8							; Backspace
+	call	CHPUT					; Print it
+	ld	a,' '						; Space
+	call	CHPUT					; Print it
+	ld	a,8							; Backspace
+	call	CHPUT					; Print it
+	jp	INPUT_TIMEOUT				; Return
 
 SET_WIFI_CHECK_INPUT:
 	xor	a
-	or	d							; counter has any digits
-	jp	z,INPUT_TIMEOUT				; nope, so just continue
+	or	d							; Counter has any digits
+	jp	z,INPUT_TIMEOUT				; Nope, so just continue
 	; IX is pointing one position after last digit, so revert
 	dec	ix
 	ld	a,(ix+0)					; Digit in A
-	sub	'0'							; convert it to decimal
-	ld	h,0							; first digit, so H is 0
-	ld	l,a							; and L has the digit
-	dec	d							; if digits finished, just set
+	sub	'0'							; Convert it to decimal
+	ld	h,0							; First digit, so H is 0
+	ld	l,a							; And L has the digit
+	dec	d							; If digits finished, just set
 	jp	z,SET_WIFI_EXECUTE_SET_COMMAND
 	dec	ix
 	ld	a,(ix+0)					; Digit in A
-	sub	'0'							; convert it to decimal
+	sub	'0'							; Convert it to decimal
 	add	a,a							; A*2
 	ld	c,a							; A*2 in C
 	add	a,a							; A*4
@@ -1013,18 +1407,18 @@ SET_WIFI_CHECK_INPUT:
 	add	a,c							; A*10
 	; Up to here, we can get 90 + 9, 99, won't go to H anyway, just add to L
 	add	a,l							; L has the first digit
-	ld	l,a							; and now L has the two digits
-	dec	d							; if digits finished, just set
+	ld	l,a							; And now L has the two digits
+	dec	d							; If digits finished, just set
 	jp	z,SET_WIFI_EXECUTE_SET_COMMAND
 	dec	ix
 	ld	a,(ix+0)					; Digit in A
-	sub	'0'							; convert it to decimal
+	sub	'0'							; Convert it to decimal
 	add	a,a							; A*2
 	ld	c,a							; A*2 in C
 	add	a,a							; A*4
 	add	a,a							; A*8
 	add	a,c							; A*10
-	ex	de,hl						; get the two digits results in de
+	ex	de,hl						; Get the two digits results in de
 	ld	l,a
 	ld	h,0							; HL = A*10
 	add	hl,hl						; HL = A*20
@@ -1036,10 +1430,17 @@ SET_WIFI_CHECK_INPUT:
 	add	hl,de						; HL = three digits result
 	; This was the last digit, up to three
 SET_WIFI_EXECUTE_SET_COMMAND:
-	jp	SET_ESP_WIFI_TIMEOUT		; and set and done
+	jp	SET_ESP_WIFI_TIMEOUT		; And set and done
 
+;============================
+;===  SETUP Menu Routines  ==
+;===      NAGLE Menu       ==
+;============================
 SET_NAGLE:
-	ld hl,MMENU_NAGLE
+	ld	a,'1'
+	call	CHPUT
+	call	WAIT_250MS_AND_THEN_CONTINUE
+	ld	hl,MMENU_NAGLE
 	call	PRINTHL					; Print Main Nagle message
 	call	CHECKNAGLE				; Nagle is on or off?
 	jr	nz,NAGLE_IS_ON				;
@@ -1070,6 +1471,10 @@ SET_NAGLE_WI_OFF:
 	call	BEEP					; Wrong Input, beep
 	jp	SET_NAGLE_WI_OFF			; And return waiting key
 
+;============================
+;===  SETUP Menu Routines  ==
+;===  Auxiliary Functions  ==
+;============================
 SET_ESP_WIFI_TIMEOUT:
 	ex	de,hl
 	ld	a,#0d
@@ -1099,6 +1504,12 @@ SET_ESP_WIFI_TIMEOUT:
 	jp	WAIT_2S_AND_THEN_MAINMENU
 
 SET_NAGLE_OFF:
+	ld	a,'O'
+	call	CHPUT
+	ld	a,#0d
+	call	CHPUT
+	ld	a,#0a
+	call	CHPUT
 	ld	hl,STR_SENDING				; Indicate it is sending a command
 	call	PRINTHL
 	ld	a,20
@@ -1119,7 +1530,7 @@ STARTWIFISCAN:
 	out	(OUT_TX_PORT),a
 	ld	hl,60						; Wait Up To 1s
 	call	WAIT_MENU_QCMD_RESPONSE
-	ret	nz							; if success return
+	ret	nz							; If success return
 	ld	a,CR
 	call	CHPUT
 	ld	a,LF
@@ -1127,6 +1538,12 @@ STARTWIFISCAN:
 	jp	MENU_SUB_BAD_END			; If error, nothing much to do, main menu
 
 SET_NAGLE_ON:
+	ld	a,'O'
+	call	CHPUT
+	ld	a,#0d
+	call	CHPUT
+	ld	a,#0a
+	call	CHPUT
 	ld	hl,STR_SENDING				; Indicate it is sending a command
 	call	PRINTHL
 	ld	a,20
@@ -1142,24 +1559,32 @@ SET_NAGLE_ON:
 
 WAIT_4S_AND_THEN_MAINMENU:
 	ld	a,240						; Wait 4 seconds with message on screen
-	jr	WAIT_2S_AND_THEN_MAINMENU_WAIT
+	jr	WAIT_AND_THEN_MAINMENU
 WAIT_2S_AND_THEN_MAINMENU:
 	ld	a,120						; Wait 2 seconds with message on screen
-WAIT_2S_AND_THEN_MAINMENU_WAIT:
+WAIT_AND_THEN_MAINMENU:
+	call	WAIT_BEFORE_CONTINUING
+	jp	ESPSETUP					; When done, back to main setup
+WAIT_650MS_AND_THEN_CONTINUE:
+	ld	a,39						; Wait 650 ms then continue
+	jr	WAIT_BEFORE_CONTINUING
+WAIT_250MS_AND_THEN_CONTINUE:
+	ld	a,15						; Wait 250 ms then continue
+WAIT_BEFORE_CONTINUING:
 	halt
 	dec	a
 	; If not zero, our time out has not elapsed
-	jr	nz,WAIT_2S_AND_THEN_MAINMENU_WAIT
-	jp	ESPSETUP					; When done, back to main setup
+	jr	nz,WAIT_BEFORE_CONTINUING
+	ret								; Time out and continue
 
-; Check Auto Clock 
+; Check Auto Clock
 ISCLKAUTO:
 	ld	a,20
 	out	(OUT_CMD_PORT),a			; Clear UART
 	ld	a,CMD_QUERY_ACLK_SETTINGS
 	out	(OUT_TX_PORT),a
 	ld	hl,60						; Wait Up To 1s
-	ld	de,(TXTTAB)					; we will borrow Basic Program memory area for now...
+	ld	de,(TXTTAB)					; We will borrow Basic Program memory area for now...
 	ld	ixl,e
 	ld	ixh,d						; address in IX
 	call	WAIT_MENU_CMD_RESPONSE
@@ -1174,9 +1599,9 @@ CHECKNAGLE:
 	ld	a,CMD_QUERY_ESP_SETTINGS
 	out	(OUT_TX_PORT),a
 	ld	hl,60						; Wait Up To 1s
-	ld	de,(TXTTAB)					; we will borrow Basic Program memory area for now...
+	ld	de,(TXTTAB)					; We will borrow Basic Program memory area for now...
 	ld	ixl,e
-	ld	ixh,d						; address in IX
+	ld	ixh,d						; Address in IX
 	call	WAIT_MENU_CMD_RESPONSE
 	jp	z,MENU_SUB_BAD_END
 	; Response received, nagle is the first one, ON: or OFF:
@@ -1189,7 +1614,7 @@ CHECKNAGLE:
 	ld	a,':'
 	cp	(ix+2)
 	jp	nz,MENU_SUB_BAD_END
-	or	a							; it will make it NZ
+	or	a							; It will make it NZ
 	ret
 CHECK_NAGLE_OFF:
 	ld	a,'F'
@@ -1213,9 +1638,9 @@ CHECKTIMEOUT:
 	ld	a,CMD_QUERY_ESP_SETTINGS
 	out	(OUT_TX_PORT),a
 	ld	hl,60						; Wait Up To 1s
-	ld	de,(TXTTAB)					; we will borrow Basic Program memory area for now...
+	ld	de,(TXTTAB)					; We will borrow Basic Program memory area for now...
 	ld	ixl,e
-	ld	ixh,d						; address in IX
+	ld	ixh,d						; Address in IX
 	call	WAIT_MENU_CMD_RESPONSE
 	jp	z,MENU_SUB_BAD_END
 	; Response received, nagle is the first one, ON: or OFF:
@@ -1232,16 +1657,16 @@ CHECKTIMEOUT:
 	jp	nz,MENU_SUB_BAD_END			; If not here, sorry to say it is an error
 CHECKTIMEOUT.1:
 	ld	a,b
-	or	c							; all data read?
+	or	c							; All data read?
 	jp	z,MENU_SUB_BAD_END			; If so, sorry to say it is an error
 	inc	ix							; At the first digit
 	dec	bc							; Remaining bytes
 	ld	a,b
-	or	c							; all data read?
+	or	c							; All data read?
 	jp	z,MENU_SUB_BAD_END			; If so, sorry to say it is an error
 	push	ix						; This is the start of the string, save it
-	ld	h,0							; no digit so far
-	; it can have up to three digits
+	ld	h,0							; No digit so far
+	; It can have up to three digits
 CHECKTIMEOUT.2:
 	ld	a,':'
 	cp	(ix+0)						; Check if it is the separator
@@ -1257,11 +1682,11 @@ CHECKTIMEOUT.2:
 	ld	a,3
 	cp	h
 	jp	c,MENU_SUB_BAD_END_1S		; If more than three digits, sorry to say it is an error
-	inc	ix							; increase pointer
-	dec	bc							; decrease remaining
+	inc	ix							; Increase pointer
+	dec	bc							; Decrease remaining
 	ld	a,b
-	or	c							; all data read?
-	jp	nz,CHECKTIMEOUT.2			; not, so rinse and repeat
+	or	c							; All data read?
+	jp	nz,CHECKTIMEOUT.2			; Not, so rinse and repeat
 CHECKTIMEOUT.3:
 	ld	(ix+0),0					; Null terminate string value
 	dec	ix
@@ -1269,7 +1694,7 @@ CHECKTIMEOUT.3:
 	sub	'0'							; Convert it to decimal value
 	ld	e,a
 	ld	d,0							; DE has first digit
-	dec	h							; decrement digit counter
+	dec	h							; Decrement digit counter
 	jr	z,CHECKTIMEOUT.END			; If all digits, done
 	; Now second digit, multiply it by 10 and add to E, even if 90 + 9, still fits E
 	dec	ix
@@ -1281,8 +1706,8 @@ CHECKTIMEOUT.3:
 	add	a,a							; A has *8
 	add	a,c							; A has *10
 	add	a,e							; A has two digits result
-	ld	e,a							; back to E, DE has two digits results
-	dec	h							; decrement digit counter
+	ld	e,a							; Back to E, DE has two digits results
+	dec	h							; Decrement digit counter
 	jr	z,CHECKTIMEOUT.END			; If all digits, done
 	; Now Third digit, multiply it by 100 and add to DE
 	dec	ix
@@ -1334,28 +1759,28 @@ WAIT_MENU_QCMD_RESPONSE:
 	ld	d,a							; Command to wait in D
 WAIT_MENU_QCMD_RESPONSE_ST1:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_QCMD_RESPONSE_ST1.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_QCMD_RESPONSE_ST1
-	jp	WAIT_MENU_QCMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_QCMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_QCMD_RESPONSE_ST1.1:
 	; nz, check the data
 	in	a,(IN_DATA_PORT)
 	cp	d							; Is response of our command?
 	jr	nz,WAIT_MENU_QCMD_RESPONSE_ST1
-	; now get return code, if return code other than 0, it is failure, otherwise success
+	; Now get return code, if return code other than 0, it is failure, otherwise success
 WAIT_MENU_QCMD_RESPONSE_RC:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_QCMD_RESPONSE_RC.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_QCMD_RESPONSE_RC
-	jp	WAIT_MENU_QCMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_QCMD_RESPONSE_END	; If time-out waiting, return
 WAIT_MENU_QCMD_RESPONSE_RC.1:
 	in	a,(IN_DATA_PORT)
 	or	a							; 0?
-	; if not, done
+	; If not, done
 	jp	nz,WAIT_MENU_QCMD_RESPONSE_END_NOK
 WAIT_MENU_QCMD_RESPONSE_END_OK:
 	ld	a,1
@@ -1380,91 +1805,95 @@ WAIT_MENU_QCMD_RESPONSE_END_NOK:
 ;
 ; Affect:
 ; AF , BC and HL
-;
 WAIT_MENU_CMD_RESPONSE:
 	push	de
 	push	ix
 	ld	d,a							; Command to wait in D
 WAIT_MENU_CMD_RESPONSE_ST1:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_CMD_RESPONSE_ST1.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_CMD_RESPONSE_ST1
-	jp	WAIT_MENU_CMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_CMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_CMD_RESPONSE_ST1.1:
 	; nz, check the data
 	in	a,(IN_DATA_PORT)
 	cp	d							; Is response of our command?
 	jr	nz,WAIT_MENU_CMD_RESPONSE_ST1
-	; now get return code, if return code other than 0, it is finished
+	; Now get return code, if return code other than 0, it is finished
 WAIT_MENU_CMD_RESPONSE_RC:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_CMD_RESPONSE_RC.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_CMD_RESPONSE_RC
-	jp	WAIT_MENU_CMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_CMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_CMD_RESPONSE_RC.1:
 	in	a,(IN_DATA_PORT)
 	or	a							; 0?
-	; if not, done
+	; If not, done
 	jp	nz,WAIT_MENU_CMD_RESPONSE_END_NOK
-	; next two bytes are size bytes, save it to BC
+	; Next two bytes are size bytes, save it to BC
 WAIT_MENU_CMD_RESPONSE_ST2A:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_CMD_RESPONSE_ST2A.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_CMD_RESPONSE_ST2A
-	jp	WAIT_MENU_CMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_CMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_CMD_RESPONSE_ST2A.1:
 	in	a,(IN_DATA_PORT)
 	ld	b,a
 WAIT_MENU_CMD_RESPONSE_ST2B:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_CMD_RESPONSE_ST2B.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_CMD_RESPONSE_ST2B
-	jp	WAIT_MENU_CMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_CMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_CMD_RESPONSE_ST2B.1:
 	in	a,(IN_DATA_PORT)
 	ld	c,a
-	or	b							; zero size in response?
+	or	b							; Zero size in response?
 	jr	z,WAIT_MENU_CMD_RESPONSE_END_OK
 	ld	d,b
-	ld	e,c							; copy to de
-	; now loop getting the data until received everything or time out
+	ld	e,c							; Copy to DE
+	; Now loop getting the data until received everything or time-out
 WAIT_MENU_CMD_RESPONSE_GET_DATA:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_CMD_RESPONSE_GET_DATA.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_CMD_RESPONSE_GET_DATA
-	jp	WAIT_MENU_CMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_CMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_CMD_RESPONSE_GET_DATA.1:
 	in	a,(IN_DATA_PORT)			; Get data
-	ld	(ix+0),a					; put it in the buffer
-	inc	ix							; increment pointer
-	dec	de							; decrement counter
+	ld	(ix+0),a					; Put it in the buffer
+	inc	ix							; Increment pointer
+	dec	de							; Decrement counter
 	ld	a,d
-	or	e							; is counter 0?
+	or	e							; Is counter 0?
 	jr	nz,WAIT_MENU_CMD_RESPONSE_GET_DATA
 WAIT_MENU_CMD_RESPONSE_END_OK:
 	ld	a,1
 	or	a							; NZ to indicate success
+	pop	ix
+	pop	de
+	ret
 WAIT_MENU_CMD_RESPONSE_END:
+	ld	b,#FF
 	pop	ix
 	pop	de
 	ret
 WAIT_MENU_CMD_RESPONSE_END_NOK:
+	ld	b,a							; Get result in B, 0xFF for time-out, otherwise was an error return code
 	xor	a
 	pop	ix
 	pop	de
 	ret
 
-; WAIT an ESP WiFi Scan command Response
+; WAIT an ESP Wi-Fi Scan command Response
 ; Inputs:
 ; A -> Command Code
 ; HL -> Timeout
@@ -1488,74 +1917,74 @@ WAIT_MENU_SCMD_RESPONSE:
 	ld	d,a							; Command to wait in D
 WAIT_MENU_SCMD_RESPONSE_ST1:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_ST1.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_ST1
-	jp	WAIT_MENU_SCMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_SCMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_SCMD_RESPONSE_ST1.1:
 	; nz, check the data
 	in	a,(IN_DATA_PORT)
 	cp	d							; Is response of our command?
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_ST1
-	; now get return code, if return code other than 0, it is finished
+	; Now get return code, if return code other than 0, it is finished
 WAIT_MENU_SCMD_RESPONSE_RC:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_RC.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_RC
-	jp	WAIT_MENU_SCMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_SCMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_SCMD_RESPONSE_RC.1:
 	in	a,(IN_DATA_PORT)
 	or	a							; 0?
-	; if not, done
+	; If not, done
 	jp	nz,WAIT_MENU_SCMD_RESPONSE_END_NOK
-	; next byte is how many access points are available
+	; Next byte is how many access points are available
 WAIT_MENU_SCMD_RESPONSE_ST2A:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_ST2A.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_ST2A
-	jp	WAIT_MENU_SCMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_SCMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_SCMD_RESPONSE_ST2A.1:
 	in	a,(IN_DATA_PORT)
-	ld	b,a							; save in B
-	ld	c,a							; and C as well
+	ld	b,a							; Save in B
+	ld	c,a							; And C as well
 	; Now should loop this until c is 0, c will control access point received count
 WAIT_MENU_SCMD_RESPONSE_ST2B:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_ST2B.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_ST2B
-	jp	WAIT_MENU_SCMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_SCMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_SCMD_RESPONSE_ST2B.1:
 	in	a,(IN_DATA_PORT)
 	ld	(ix+0),a
-	inc	ix							; increment pointer
-	or	a							; terminator of AP Name?
+	inc	ix							; Increment pointer
+	or	a							; Terminator of AP Name?
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_ST2B
 	; Get encryption
 WAIT_MENU_SCMD_RESPONSE_GET_ENC:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_GET_ENC.1
 	call	HLTIMEOUT
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_GET_ENC
-	jp	WAIT_MENU_CMD_RESPONSE_END	; if time out waiting, return
+	jp	WAIT_MENU_CMD_RESPONSE_END	; If time out waiting, return
 WAIT_MENU_SCMD_RESPONSE_GET_ENC.1:
 	in	a,(IN_DATA_PORT)			; Get data
 	sub	'O'							; If O, open, will be 0, otherwise, will be notzero
-	ld	(ix+0),a					; put it in the buffer
-	inc	ix							; increment pointer
-	dec	c							; decrement counter
+	ld	(ix+0),a					; Put it in the buffer
+	inc	ix							; Increment pointer
+	dec	c							; Decrement counter
 	xor	a
-	or	c							; is counter 0?
-	; if not continue getting more SSIDs
+	or	c							; Is counter 0?
+	; If not continue getting more SSIDs
 	jr	nz,WAIT_MENU_SCMD_RESPONSE_ST2B
-	; it is zero, so, done
+	; It is zero, so, done
 WAIT_MENU_SCMD_RESPONSE_END_OK:
 	ld	a,1
 	or	a							; NZ to indicate success
@@ -1590,14 +2019,26 @@ PRINTHL:
 	inc	hl
 	jp	PRINTHL
 
-; Routine to print the string addressed by BC
-PRINTBC:
-	ld	a,(bc)
+; Routine to print the string addressed by HL on a line, if exceeding it, ends with ..
+PRINTHLINE:
+	push	bc
+	ld	b,27
+PHLINEL:
+	ld	a,(hl)
 	or	a
-	ret	z							; When string is finished, done!
+	jr	z,PHLINELR					; When string is finished, done!
 	call	CHPUT
-	inc	bc
-	jp	PRINTBC
+	inc	hl
+	djnz	PHLINEL
+	ld	a,'.'
+	call	CHPUT
+	ld	a,'.'
+	call	CHPUT
+	ld	a,GOLEFT
+	call	CHPUT
+PHLINELR:
+	pop	bc
+	ret
 
 ;===============================
 ;===  HTIM_I hook execution  ===
@@ -1684,8 +2125,7 @@ DO_EXTBIO3:							; A=A-1 already done
 	ret
 
 
-;--- Jump here to execute old EXTBIO code
-
+; Jump here to execute old EXTBIO code
 JUMP_OLD2:
 	ld	de,#2222
 JUMP_OLD:							; Assumes "push hl,bc,af" done
@@ -1745,17 +2185,15 @@ OK_FNUM:
 	ex	(sp),hl
 	ret
 
-;--- Undefined function: return with registers unmodified
+; Undefined function: return with registers unmodified
 UNDEFINED:
 	pop	af
 	pop	hl
 	ret
 
-
 ;===================================
 ;===  Functions addresses table  ===
 ;===================================
-
 ;--- Implementation-specific routines addresses table
 
 	if	MAX_IMPFN >= 128
@@ -1770,9 +2208,9 @@ FN_0:					dw	UNAPI_GET_INFO
 FN_1:					dw	TCPIP_GET_CAPAB
 FN_2:					dw	TCPIP_GET_IPINFO
 FN_3:					dw	TCPIP_NET_STATE
-;TCPIP_SEND_ECHO not going to be implemented, ESP do not support ping like UNAPI specify
+; TCPIP_SEND_ECHO not going to be implemented, ESP do not support ping like UNAPI specify
 FN_4:					dw	FN_NOT_IMP
-;TCPIP_RCV_ECHO not going to be implemented as SEND_ECHO is not implemented
+; TCPIP_RCV_ECHO not going to be implemented as SEND_ECHO is not implemented
 FN_5:					dw	FN_NOT_IMP
 FN_6:					dw	TCPIP_DNS_Q
 FN_7:					dw	TCPIP_DNS_S
@@ -1787,25 +2225,24 @@ FN_15:					dw	TCPIP_TCP_ABORT
 FN_16:					dw	TCPIP_TCP_STATE
 FN_17:					dw	TCPIP_TCP_SEND
 FN_18:					dw	TCPIP_TCP_RCV
-;TCPIP_TCP_FLUSH makes no sense as we do not use buffers to send, any buffer is internal to ESP and we can't delete
+; TCPIP_TCP_FLUSH makes no sense as we do not use buffers to send, any buffer is internal to ESP and we can't delete
 FN_19:					dw	FN_NOT_IMP
-;TCPIP_RAW_OPEN not going to be implemented, ESP do not support RAW connections
+; TCPIP_RAW_OPEN not going to be implemented, ESP do not support RAW connections
 FN_20:					dw	FN_NOT_IMP
-;TCPIP_RAW_CLOSE not going to be implemented, ESP do not support RAW connections
+; TCPIP_RAW_CLOSE not going to be implemented, ESP do not support RAW connections
 FN_21:					dw	FN_NOT_IMP
-;TCPIP_RAW_STATE not going to be implemented, ESP do not support RAW connections
+; TCPIP_RAW_STATE not going to be implemented, ESP do not support RAW connections
 FN_22:					dw	FN_NOT_IMP
-;TCPIP_RAW_SEND not going to be implemented, ESP do not support RAW connections
+; TCPIP_RAW_SEND not going to be implemented, ESP do not support RAW connections
 FN_23:					dw	FN_NOT_IMP
-;TCPIP_RAW_RCV not going to be implemented, ESP do not support RAW connections
+; TCPIP_RAW_RCV not going to be implemented, ESP do not support RAW connections
 FN_24:					dw	FN_NOT_IMP
 FN_25:					dw	TCPIP_CONFIG_AUTOIP
 FN_26:					dw	TCPIP_CONFIG_IP
 FN_27:					dw	TCPIP_CONFIG_TTL
 FN_28:					dw	TCPIP_CONFIG_PING
-;TCPIP_WAIT not needed for our implementation
+; TCPIP_WAIT not needed for our implementation
 FN_29:					dw	END_OK
-
 
 ;========================
 ;===  Functions code  ===
@@ -1814,9 +2251,9 @@ FN_NOT_IMP:
 	ld	a,ERR_NOT_IMP
 	ret
 
-END_OK:	
+END_OK:
 	xor a
-	ret	
+	ret
 
 ; Most functions do not have special handling on time out and can use this.
 ; If there is a need to retry sending or receiving on time-out, then a custom
@@ -1842,7 +2279,7 @@ TCPIP_GENERIC_CHECK_TIME_OUT:
 ;========================
 ;===  UNAPI_GET_INFO  ===
 ;========================
-;Obtain the implementation name and version.
+; Obtain the implementation name and version.
 ;
 ;    Input:  A  = 0
 ;    Output: HL = Descriptive string for this implementation, on this slot, zero terminated
@@ -1859,15 +2296,15 @@ UNAPI_GET_INFO:
 ;=========================
 ;===  TCPIP_GET_CAPAB  ===
 ;=========================
-;Get information about the TCP/IP capabilities and features.
+; Get information about the TCP/IP capabilities and features.
 ;
-;Input:  A = 1
-;        B = Index of information block to retrieve:
-;            1: Capabilities and features flags, link level protocol
-;            2: Connection pool size and status
-;            3: Maximum datagram size allowed
-;            4: Second set of capabilities and features flags
-;Output: A = Error code
+;    Input:  A = 1
+;            B = Index of information block to retrieve:
+;                1: Capabilities and features flags, link level protocol
+;                2: Connection pool size and status
+;                3: Maximum datagram size allowed
+;                4: Second set of capabilities and features flags
+;    Output: A = Error code
 ;        When information block 1 requested:
 ;            HL = Capabilities flags
 ;            DE = Features flags
@@ -1900,7 +2337,7 @@ TCPIP_GET_CAPAB:
 	call	SETCOUNTER
 TCPIP_GET_CAPAB_ST1:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_ST1.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_ST1
@@ -1909,10 +2346,10 @@ TCPIP_GET_CAPAB_ST1.1:
 	in	a,(IN_DATA_PORT)
 	cp	1							; Is response of our command?
 	jr	nz,TCPIP_GET_CAPAB_ST1
-	; now get return code, if return code other than 0, it is finished
-TCPIP_GET_CAPAB_RC:	
+	; Now get return code, if return code other than 0, it is finished
+TCPIP_GET_CAPAB_RC:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_RC.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_RC
@@ -1920,23 +2357,23 @@ TCPIP_GET_CAPAB_RC.1:
 	; nz, discard
 	in	a,(IN_DATA_PORT)
 	or	a							; 0?
-	ret	nz							; if not, done
+	ret	nz							; If not, done
 
-	; next two bytes are return code and size bytes, don't care
+	; Next two bytes are return code and size bytes, don't care
 	ld	b,2
 TCPIP_GET_CAPAB_ST2:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_ST2.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_ST2
 TCPIP_GET_CAPAB_ST2.1:
-	; nz, discard
+	; Nz, discard
 	in	a,(IN_DATA_PORT)
 	dec	b
 	jr	nz,TCPIP_GET_CAPAB_ST2
 
-	; now check if block 1, 2 or 3
+	; Now check if block 1, 2 or 3
 	call	GETBYTE					; Get the parameter we saved at the start
 	dec	a
 	jp	z,TCPIP_GET_CAPAB_BLK1		; 1
@@ -1944,13 +2381,13 @@ TCPIP_GET_CAPAB_ST2.1:
 	jp	z,TCPIP_GET_CAPAB_BLK2		; 2
 	dec	a
 	jp	z,TCPIP_GET_CAPAB_BLK3		; 3
-	; else, only block four, same as block 1
+	; Else, only block four, same as block 1
 	jp	TCPIP_GET_CAPAB_BLK1		; 1
 	; Block 3 Handling, we will receive L, H, E and D
 TCPIP_GET_CAPAB_BLK3:
 TCPIP_GET_CAPAB_BLK3_ST1:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK3_ST1.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK3_ST1
@@ -1960,7 +2397,7 @@ TCPIP_GET_CAPAB_BLK3_ST1.1:
 	ld	l,a
 TCPIP_GET_CAPAB_BLK3_ST2:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK3_ST2.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK3_ST2
@@ -1970,7 +2407,7 @@ TCPIP_GET_CAPAB_BLK3_ST2.1:
 	ld	h,a
 TCPIP_GET_CAPAB_BLK3_ST3:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK3_ST3.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK3_ST3
@@ -1980,7 +2417,7 @@ TCPIP_GET_CAPAB_BLK3_ST3.1:
 	ld	e,a
 TCPIP_GET_CAPAB_BLK3_ST4:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK3_ST4.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK3_ST4
@@ -1988,7 +2425,7 @@ TCPIP_GET_CAPAB_BLK3_ST4.1:
 	; nz, get it
 	in	a,(IN_DATA_PORT)
 	ld	d,a
-	; done
+	; Done
 	xor a
 	ret
 
@@ -1996,7 +2433,7 @@ TCPIP_GET_CAPAB_BLK2:
 	; Block 2 Handling, we will receive B, C, D, E, H, L
 TCPIP_GET_CAPAB_BLK2_ST1:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK2_ST1.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK2_ST1
@@ -2006,7 +2443,7 @@ TCPIP_GET_CAPAB_BLK2_ST1.1:
 	ld	b,a
 TCPIP_GET_CAPAB_BLK2_ST2:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK2_ST2.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK2_ST2
@@ -2016,7 +2453,7 @@ TCPIP_GET_CAPAB_BLK2_ST2.1:
 	ld	c,a
 TCPIP_GET_CAPAB_BLK2_ST3:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK2_ST3.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK2_ST3
@@ -2026,7 +2463,7 @@ TCPIP_GET_CAPAB_BLK2_ST3.1:
 	ld	d,a
 TCPIP_GET_CAPAB_BLK2_ST4:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK2_ST4.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK2_ST4
@@ -2036,7 +2473,7 @@ TCPIP_GET_CAPAB_BLK2_ST4.1:
 	ld	e,a
 TCPIP_GET_CAPAB_BLK2_ST5:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK2_ST5.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK2_ST5
@@ -2046,7 +2483,7 @@ TCPIP_GET_CAPAB_BLK2_ST5.1:
 	ld	h,a
 TCPIP_GET_CAPAB_BLK2_ST6:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK2_ST6.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK2_ST6
@@ -2054,7 +2491,7 @@ TCPIP_GET_CAPAB_BLK2_ST6.1:
 	; nz, get it
 	in	a,(IN_DATA_PORT)
 	ld	l,a
-	; done
+	; Done
 	xor	a
 	ret
 
@@ -2062,7 +2499,7 @@ TCPIP_GET_CAPAB_BLK1:
 	; Block 1 Handling, we will receive L, H, E, D and B
 TCPIP_GET_CAPAB_BLK1_ST1:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK1_ST1.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK1_ST1
@@ -2072,7 +2509,7 @@ TCPIP_GET_CAPAB_BLK1_ST1.1:
 	ld	l,a
 TCPIP_GET_CAPAB_BLK1_ST2:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK1_ST2.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK1_ST2
@@ -2082,7 +2519,7 @@ TCPIP_GET_CAPAB_BLK1_ST2.1:
 	ld	h,a
 TCPIP_GET_CAPAB_BLK1_ST3:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK1_ST3.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK1_ST3
@@ -2092,7 +2529,7 @@ TCPIP_GET_CAPAB_BLK1_ST3.1:
 	ld	e,a
 TCPIP_GET_CAPAB_BLK1_ST4:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK1_ST4.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK1_ST4
@@ -2102,7 +2539,7 @@ TCPIP_GET_CAPAB_BLK1_ST4.1:
 	ld	d,a
 TCPIP_GET_CAPAB_BLK1_ST5:
 	in	a,(IN_STS_PORT)
-	bit	0,a							; if nz has data
+	bit	0,a							; If nz has data
 	jr	nz,TCPIP_GET_CAPAB_BLK1_ST5.1
 	call	TCPIP_GENERIC_CHECK_TIME_OUT
 	jr	TCPIP_GET_CAPAB_BLK1_ST5
@@ -2110,7 +2547,7 @@ TCPIP_GET_CAPAB_BLK1_ST5.1:
 	; nz, get it
 	in	a,(IN_DATA_PORT)
 	ld	b,a
-	; done
+	; Done
 	xor	a
 	ret
 
@@ -2137,7 +2574,7 @@ TCPIP_GET_IPINFO:
 	out	(OUT_TX_PORT),a				; Send the command size lsb
 	ld	a,b
 	out (OUT_TX_PORT),a				; Send the parameter
-	
+
 	; Now wait up to 600 ticks to get response
 	ld	hl,600
 	call	SETCOUNTER
@@ -2488,9 +2925,9 @@ TCPIP_DNS_S:
 	;--- Ok, we have a result, is it success?
 	dec a
 	jr	z,TCPIP_DNS_S_HASRESULT		; If it is 1, it was not an error
-	;--- Shoot, there is an error....
+	;--- Shoot, there is an error...
 	;--- And sure thing, ESP do not tell us details, it is always failure :-P
-	bit	0,b							;--- clear error after this?	
+	bit	0,b							;--- clear error after this?
 	jr	z,TCP_IP_DNS_S_NOCLR
 	;--- Clear
 	ld b,0							;--- Like I've said, no details
@@ -2519,7 +2956,7 @@ TCP_IP_DNS_S_RES_NOCLR:
 TCPIP_DNS_S_NORESULT:
 	xor	a							;--- OK no query in progress, no result, means nothing in progress
 	ld	b,0							;--- No query in progress
-	ret	
+	ret
 
 ;========================
 ;===  TCPIP_UDP_OPEN  ===
@@ -2909,7 +3346,7 @@ TCPIP_UDP_SEND_ST2.1:
 ;        IX = Source port
 ;        BC = Actual received data size
 
-; Customized TIME OUT routine: If time out receiving data, retry as received data 
+; Customized TIME OUT routine: If time out receiving data, retry as received data
 ; won't be re-sent as host is unaware of this
 TCPIP_UDP_RCV_CHECK_TIME_OUT:
 	; Save registers other than AF
@@ -3102,7 +3539,7 @@ TCPIP_UDP_RCV_R:
 	bit	4,a							; Buffer underrun?
 	jp	nz,TCPIP_TCP_UDP_RETRY_QRCV	; If yes, retry
 	; Otherwise, done
-	; done, restore return data in DE BC and HL 
+	; done, restore return data in DE BC and HL
 	call	REGRESTORE
 	xor	a
 	ret
@@ -3118,7 +3555,7 @@ TCPIP_UDP_RCV_R_NSF.1:
 	jr	nz,TCPIP_UDP_RCV_R_NSF			; We do not use INIR because we don't know if there is more data, avoiding geting a junk 0xFF
 	dec	d
 	jr	nz,TCPIP_UDP_RCV_R_NSF
-	; done, restore return data in DE BC and HL 
+	; done, restore return data in DE BC and HL
 	call	REGRESTORE
 	xor	a
 	ret
@@ -3142,8 +3579,8 @@ TCPIP_UDP_RCV_R_NSF.1:
 ;+8 (2): Suggestion for user timeout value
 ;+10 (1): Flags:
 ;         bit 0: Set for passive connection
-;         bit 1: Set for resident connection	
-;         bit 2: Set for TLS connection	
+;         bit 1: Set for resident connection
+;         bit 2: Set for TLS connection
 ;         bit 3: Set for TLS connection validating host certificate
 ;+11 (2): If 0000 no host name validation, otherwise the hostname string address (zero terminated)
 ;TCP_OPEN_IP1				(ix+0)
@@ -3230,7 +3667,7 @@ TCPIP_TCP_OPEN_CHECK_HOSTOF:
 	or	a							; If zero, hostname terminated
 	; Loop until terminator (0) is found
 	jp	nz,TCPIP_TCP_OPEN_CHECK_HOSTOF
-	
+
 TCPIP_TCP_OPEN_HOSTNAME_SENDCMDWITHHOSTNAME:
 	; Ok, so, DE has the full hostname size, let's start sending from here
 	ld	a,13						; Function TCP OPEN
@@ -3585,7 +4022,7 @@ TCPIP_TCP_STATE_ST2.1:
 	dec	b
 	jr	nz,TCPIP_TCP_STATE_ST2
 
-	; now just get the 16 bytes (Port LSB then MSB, # of packets, packet size LSB then MSB) and order it in C, B, L, H, E, D, IXL and IXH. 
+	; now just get the 16 bytes (Port LSB then MSB, # of packets, packet size LSB then MSB) and order it in C, B, L, H, E, D, IXL and IXH.
 	; Remaining 8 bytes go to TCP_STATE_INFORMATION_BLOCK if its value is other than 0
 TCPIP_TCP_STATE_RESP_ST1:
 	in	a,(IN_STS_PORT)
@@ -3727,7 +4164,7 @@ TCPIP_TCP_STATE_SAVE_IBLOCK.1:
 ;        C  = Flags:
 ;             bit 0: Send the data PUSHed
 ;             bit 1: The data is urgent
-;Output: A = Error code	
+;Output: A = Error code
 TCPIP_TCP_SEND_ERROR:
 	; next two bytes are size bytes, don't care
 	ld	b,a							; save error in b
@@ -3758,7 +4195,7 @@ TCPIP_TCP_SEND:
 	out	(OUT_TX_PORT),a				; Send the command size msb
 	ld	a,l
 	out	(OUT_TX_PORT),a				; Send the command size lsb
-	ld	a,b 
+	ld	a,b
 	out	(OUT_TX_PORT),a				; Send the connection #
 	ld	a,c
 	out	(OUT_TX_PORT),a				; Send the connection flags
@@ -4053,7 +4490,7 @@ TCPIP_CONFIG_AUTOIP:
 	ld	a,2
 	out	(OUT_TX_PORT),a				; Send the command size lsb
 	ld	a,b
-	out	(OUT_TX_PORT),a				; Send the command 
+	out	(OUT_TX_PORT),a				; Send the command
 	ld	a,c
 	out	(OUT_TX_PORT),a				; Send the command parameter
 
@@ -4193,7 +4630,7 @@ TCPIP_CONFIG_TTL:
 	ret	nz
 	ld	a,b
 	or	a
-	; Cant set, so NOT IMP 
+	; Cant set, so NOT IMP
 	ld	a,ERR_NOT_IMP
 	ret	nz							; if not get, not implemented
 	; get, so just return D = #FF, A = OK = 0 and E = 0
@@ -4211,7 +4648,7 @@ TCPIP_CONFIG_TTL:
 ;        B = 0: Get current flag value
 ;            1: Set flag value (ERR_NOT_IMP)
 ;        C = New flag value (only if B=1):
-;            0: Off 
+;            0: Off
 ;            1: On
 ;Output: A = Error code
 ;        C = Flag value after the routine execution
@@ -4223,10 +4660,10 @@ TCPIP_CONFIG_PING:
 	ret	nz
 	ld	a,b
 	or	a
-	; Cant set, so NOT IMP 
+	; Cant set, so NOT IMP
 	ld	a,ERR_NOT_IMP
 	ret	nz							; if not get, not implemented
-	; get, so just return C = 1, A = OK = 0 
+	; get, so just return C = 1, A = OK = 0
 	xor	a
 	ld	c,1
 	ret
@@ -4396,7 +4833,7 @@ GETCOUNTER:
 
 ;--- Set our HTIM_I driven counter value in high memory
 ;    Input:  HL = new counter value
-;    Output: noone
+;    Output: none
 ;    Modifies: AF, HL, DE, BC
 
 SETCOUNTER:
@@ -4576,7 +5013,7 @@ REGBACKUP:
 
 ;--- Restores BC copy saved in high memory
 ;    Input:  none
-;    Output: BC 
+;    Output: BC
 ;    Modifies: AF
 
 BCRESTORE:
@@ -4622,7 +5059,7 @@ BCBACKUP:
 
 ;--- Restores HL copy saved in high memory
 ;    Input:  none
-;    Output: HL 
+;    Output: HL
 ;    Modifies: AF
 
 HLRESTORE:
@@ -4678,7 +5115,7 @@ GETDNSREADY:
 	push	de
 	push	hl
 	call	GETSLT
-	; Slot in A, now get the address 
+	; Slot in A, now get the address
 	call	GETMEMPOINTER
 	; HL has the address of our memory area, DNS ready is 8 bytes after start
 	ld	de,MEMORY_DNS_READY_OFFSET
@@ -4722,7 +5159,7 @@ SETDNSREADY:
 GETDNSRESULT:
 	push	bc
 	call	GETSLT
-	; Slot in A, now get the address 
+	; Slot in A, now get the address
 	call	GETMEMPOINTER
 	; HL has the address of our memory area, DNS result is 9 bytes after start
 	ld	de,MEMORY_DNS_RES_OFFSET
@@ -4865,6 +5302,8 @@ WRFE_RET_ERROR:
 ;*** failure							   ***
 ;*********************************************
 RESET_ESP:
+	ld	b,10						; Retry up to 10 times
+RESET_ESP_LOOP:
 	ld	a,20
 	out	(OUT_CMD_PORT),a			; Clear UART
 	xor	a
@@ -4874,18 +5313,23 @@ RESET_ESP:
 	ld	a,CMD_WRESET_ESP
 	out	(OUT_TX_PORT),a
 	ld	hl,RSP_CMD_RESET_ESP		; Expected response
-	ld	de,180						; Up to 3s @ 60Hz
+	ld	de,90						; Up to 1.5s @ 60Hz
 	ld	a,RSP_CMD_RESET_ESP_SIZE	; Size of response
+	push	bc						; Save retry counter
 	call	WAIT_RESPONSE_FROM_ESP
-	or	a
-	ret	z
+	pop	bc							; restore retry counter
+	or	a							; Did WAIT RESPONSE return zero?
+	ret	z							; Yes, Warm Reset Ok and ESP Found
+	djnz RESET_ESP_LOOP				; No, decrement retry counter and let the loop check
+	; No more retries? Then check if it is old ESP FW
+RESET_CHK_IF_INSTALLED:
 	; Ok, Warm Reset did not work, is ESP installed?
 	ld	a,20
 	out	(OUT_CMD_PORT),a			; Clear UART
 	ld	a,CMD_QUERY_ESP
 	out	(OUT_TX_PORT),a
 	ld	hl,RSP_CMD_QUERY_ESP		; Expected response
-	ld	de,180						; Up to 1s @ 60Hz
+	ld	de,180						; Up to 3s @ 60Hz
 	ld	a,RSP_CMD_QUERY_ESP_SIZE	; Size of response
 	call	WAIT_RESPONSE_FROM_ESP
 	or	a
@@ -5043,7 +5487,7 @@ SET_RTC_REG:
 ; Third pair is updated with value in D
 SET_RTC_DATE:
 	call	STOP_RTC_COUNT_SET_MODE0; Select RTC Register 13, and set Mode / Page 0
-	or	1							; Set Bit 0, so Mode / Page 1 
+	or	1							; Set Bit 0, so Mode / Page 1
 	out	(#B5),a						; save it in register 13, now page 1 selected
 	ld	a,#B						; Leap Year Counter Register
 	out	(#B4),a						; Select it
@@ -5051,7 +5495,7 @@ SET_RTC_DATE:
 	out	(#B5),a						; So it has count of leap years (0 is 1980, leap, and every time it is 4, leap year again)
 	call	STOP_RTC_COUNT_SET_MODE0; Select RTC Register 13 and set mode / page 0
 	call	STOP_RTC_COUNT_SET_MODE0; do it a second time... DOS does it, don't want to JYNX it :P
-	ld	e,7							; Register 7 
+	ld	e,7							; Register 7
 SET_RTC_DATE.1:
 	ld	a,l							; A has day
 	call	RTC_SAVE_REGISTERPAIR	; Will convert day to BCD and save in registers 7 and 8
@@ -5073,6 +5517,10 @@ SET_RTC_DATE.1:
 CMD_RESET_ESP			equ	'R'
 ; Warm reset of ESP firmware
 CMD_WRESET_ESP			equ	'W'
+; Hold Wi-Fi Connection On
+CMD_WIFIHOLD_ESP		equ	'H'
+; Release Wi-Fi Connection Hold
+CMD_WIFIRELEASE_ESP		equ	'h'
 ; Get Updated time and date from internet
 CMD_GET_TIME			equ	'G'
 ; Query Auto Clock settings
@@ -5087,7 +5535,7 @@ CMD_TIMER_SET			equ	'T'
 CMD_NAGLE_ON			equ	'D'
 ; Turn Nagle Off
 CMD_NAGLE_OFF			equ	'N'
-; Turn WiFi Off
+; Turn Wi-Fi Off
 CMD_WIFI_OFF			equ	'O'
 ; Request to connect to a network
 CMD_WIFI_CONNECT		equ	'A'
@@ -5095,6 +5543,8 @@ CMD_WIFI_CONNECT		equ	'A'
 CMD_SCAN_START			equ	'S'
 ; Request network scan result
 CMD_SCAN_RESULTS		equ	's'
+; Request AP Status
+CMD_AP_STS				equ	'g'
 ; Get ESP firmware version
 CMD_GET_ESP_VER			equ	'V'
 ; After finishing Warm reset, ESP returns ready
@@ -5107,185 +5557,297 @@ RSP_CMD_QUERY_ESP		db	"OK"
 RSP_CMD_QUERY_ESP_SIZE	equ	2
 
 ;--- Strings
+; Special thanks to KdL
+; He has contributed a lot to make the menus and strings
+; concise and much easier to read and understand!
 STTERMINATOR			equ	0
 LF						equ	10
+HOME					equ	11
 CLS						equ	12
 CR						equ	13
 GOLEFT					equ	29
 
+ENTERING_WIFI_SETUP:
+	db	CLS
+	db	"Entering Wi-Fi Setup..."		,CR,LF,LF,STTERMINATOR
+;---
+
+WELCOME:
+	db	CLS
+	db	"ESP8266 TCP/IP UNAPI 1.2"		,CR,LF
+	db	"(c)2020 Oduvaldo Pavan Junior"	,GOLEFT,CR,LF
+	db	"ducasp@gmail.com"				,CR,LF,LF,STTERMINATOR
+;---
+
 WELCOME_S:
-	db	CLS,"ESP8266 TCP/IP UNAPI 1.2",CR,LF
-	db	"(c)2020 Oduvaldo Pavan Junior",GOLEFT,CR,LF,LF
-	db	"ducasp@gmail.com",CR,LF,LF
-	db	"Quick Rcv not supported",CR,LF
-	db	"SM-X FW Update Recommended",CR,LF,LF,STTERMINATOR
+	db	"Quick Receive not supported."	,CR,LF
+	db	"Machine FW Update Suggested!"	,CR,LF,LF,STTERMINATOR
+;---
 
 WELCOME_SF:
-	db	CLS,"ESP8266 TCP/IP UNAPI 1.2",CR,LF,LF
-	db	"(c)2020 Oduvaldo Pavan Junior",GOLEFT,CR,LF
-	db	"ducasp@gmail.com",CR,LF
-	db	"Quick Rcv supported",CR,LF,LF,STTERMINATOR
+	db	"Quick Receive supported."		,CR,LF,LF,STTERMINATOR
+;---
+
+WELCOME_CS0:
+	db	"Wi-Fi is Idle, AP configured:"	,GOLEFT,CR,LF,STTERMINATOR
+
+WELCOME_CS1:
+	db	"Wi-Fi Connecting to AP:"		,CR,LF,STTERMINATOR
+
+WELCOME_CS2:
+	db	"Wi-Fi Wrong Password for AP:"	,CR,LF,STTERMINATOR
+
+WELCOME_CS3:
+	db	"Wi-Fi Did not find AP:"		,CR,LF,STTERMINATOR
+
+WELCOME_CS4:
+	db	"Wi-Fi Failed to connect to:"	,CR,LF,STTERMINATOR
+
+WELCOME_CS5:
+	db	"Wi-Fi Connected to:"			,CR,LF,STTERMINATOR
 
 MMENU_S:
-	db	"1 - Change Nagle Setting",CR,LF
-	db	"2 - Change WiFi On Period",CR,LF
-	db	"3 - Scan/Join Access Points",CR,LF
-	db	"4 - WiFi On/Off & Auto Clock",CR,LF,LF
-	db	"ESC to exit setup",CR,LF,LF
-	db	"Option: ",STTERMINATOR
+	db	"1 - Set Nagle Algorithm"		,CR,LF
+	db	"2 - Set Wi-Fi On Period"		,CR,LF
+	db	"3 - Scan/Join Access Points"	,CR,LF
+	db	"4 - Wi-Fi and Clock Settings"	,CR,LF,LF
+;---
+	db	"ESC to exit setup."			,CR,LF,LF
+;---
+	db	"Option: "						,STTERMINATOR
 
 MMENU_CLOCK_MSX2:
-	db	CLS," [ WiFi and Clock Settings ]",CR,LF,LF
-	db	"0 - WiFi & UNAPI are enabled",CR,LF
-	db	"1 - Also wait up to 10s for",CR,LF
-	db	"    internet availability and",GOLEFT,CR,LF
-	db	"    get time from SNTP server",GOLEFT,CR,LF
-	db	"    adjusting the timezone",CR,LF
-	db	"2 - The same as option 1 but",CR,LF
-	db	"    also will turn off WiFi",CR,LF
-	db	"    when done",CR,LF
-	db	"3 - WiFi & UNAPI are disabled",GOLEFT,CR,LF,LF
-	db	"MSX boot will take longer if",CR,LF
-	db	"options 1 or 2 are active.",CR,LF,LF,STTERMINATOR
+	db	CLS
+	db	"[ Wi-Fi and Clock Settings ]"	,CR,LF,LF
+;---
+	db	"0 - Wi-Fi & UNAPI are online"	,CR,LF
+	db	"1 - Also wait up to 10s for"	,CR,LF
+	db	"    internet availability and"	,GOLEFT,CR,LF
+	db	"    get time from SNTP server"	,GOLEFT,CR,LF
+	db	"    adjusting the time zone"	,CR,LF
+	db	"2 - The same as option 1 but"	,CR,LF
+	db	"    also will turn off Wi-Fi"	,CR,LF
+	db	"    when done"					,CR,LF
+	db	"3 - Wi-Fi & UNAPI are offline"	,GOLEFT,CR,LF,LF
+;---
+	db	"MSX boot will take longer if"	,CR,LF
+	db	"options 1 or 2 are active."	,CR,LF,LF,STTERMINATOR
+;---
 
 MMENU_CLOCK_MSX1:
-	db	CLS," [ WiFi and Clock Settings ]",CR,LF,LF
-	db	"0 - WiFi & UNAPI are enabled",CR,LF
-	db	"1 - Unavailable for MSX1",CR,LF
-	db	"2 - Unavailable for MSX1",CR,LF
-	db	"3 - WiFi & UNAPI are disabled",GOLEFT,CR,LF,LF,STTERMINATOR
-
-MMENU_CLOCK_0_MSX1:
-	db	"Currently Enabled",CR,LF,STTERMINATOR
-
-MMENU_CLOCK_3_MSX1:
-	db	"Currently Disabled",CR,LF,STTERMINATOR
+	db	CLS
+	db	"[ Wi-Fi and Clock Settings ]"	,CR,LF,LF
+;---
+	db	"0 - Wi-Fi & UNAPI are online"	,CR,LF
+	db	"1 - Unavailable for MSX1"		,CR,LF
+	db	"2 - Unavailable for MSX1"		,CR,LF
+	db	"3 - Wi-Fi & UNAPI are offline"	,GOLEFT,CR,LF,LF,STTERMINATOR
+;---
 
 MMENU_CLOCK_0:
-	db	"Currently off, GMT: ",STTERMINATOR
+	db	"Currently: ONLINE"				,STTERMINATOR
 
 MMENU_CLOCK_1:
-	db	"Currently on, GMT: ",STTERMINATOR
+	db	"Currently: TIME-OPT1, GMT"		,STTERMINATOR
 
 MMENU_CLOCK_2:
-	db	"Currently on (WiFi off after",CR,LF
-	db	"boot), GMT: ",STTERMINATOR
+	db	"Currently: TIME-OPT2, GMT"		,STTERMINATOR
 
 MMENU_CLOCK_3:
-	db	"Currently disabled, GMT: ",STTERMINATOR
+	db	"Currently: OFFLINE"			,STTERMINATOR
 
 MMENU_CLOCK_OPT:
-	db	CR,LF,LF,"ESC to return to main menu",CR,LF,LF
-	db	"Option: ",STTERMINATOR
+	db	CR,LF,LF
+;---
+	db	"ESC to return to main menu."	,CR,LF,LF
+;---
+	db	"Option: "						,STTERMINATOR
 
 MMENU_GMT_OPT:
-	db	CR,LF,"Time Zone Adjustment: ",STTERMINATOR
+	db	CR,LF
+	db	"Time Zone adjustment: "		,STTERMINATOR
 
+MMENU_MANUALENTRY:
+	db	CLS
+	db	"[ Scan/Join Access Points ]"	,CR,LF,LF
+;---
+	db	"ESC to return to main menu."	,CR,LF
+	db	"Manual entry, type SSID:"		,CR,LF,STTERMINATOR
+
+MENU_MANUALENTRY_PWD:
+	db	CR,LF,LF
+;---
+	db	"Password needed? "				,STTERMINATOR
 
 MMENU_SCAN:
-	db	CLS,"      [ Scan/Join APs ]",CR,LF,LF
-	db	"Up to 10 APs will be listed",CR,LF,LF
-	db	"Scanning networks...",STTERMINATOR
+	db	CLS
+	db	"[ Scan/Join Access Points ]"	,CR,LF,LF
+;---
+	db	"Up to ",SCAN_MAX_PAGE_SIZE+48," APs per page."	,CR,LF,LF
+;---
+	db	"Scanning networks..."			,CR,LF,STTERMINATOR
 
 MMENU_SCANF:
-	db	CR,"Error or no networks found!",CR,LF,STTERMINATOR
+	db	CR,LF
+	db	"Error or no networks found!"	,CR,LF,STTERMINATOR
 
 MMENU_SCANN:
-	db	CR,"No networks found!         ",CR,LF,STTERMINATOR
+	db	CR,LF
+	db	"No networks found!"			,CR,LF,STTERMINATOR
 
 MMENU_SCANS:
-	db	CR,"Networks Available: ",CR,LF,LF,STTERMINATOR
+	db	CLS
+	db	"[ Scan/Join Access Points ]"	,CR,LF,LF
+;---
+	db	"Networks available:"			,CR,LF,LF,STTERMINATOR
+;---
 
 MMENU_CONNECTING:
-	db	CR,LF,"Requesting connection...",CR,LF,STTERMINATOR
+	db	CLS
+	db	"[ Scan/Join Access Points ]"	,CR,LF,LF
+;---
+	db	"Requesting connection to:"		,CR,LF,LF,STTERMINATOR
+;---
 
 MMENU_ASKPWD:
-	db	CR,LF,"(Hit DEL as first character",CR,LF
-	db	"to hide it) Password : ",STTERMINATOR
+	db	CR,LF
+	db	"Hit DEL as first character"	,CR,LF
+	db	"to hide/show the typing."		,CR,LF
+	db	"Password: "					,STTERMINATOR
 
 MMENU_SCANQ:
-	db	CR,LF,"ESC to return to main menu",CR,LF,LF
-	db	"Number to connect : ",STTERMINATOR
+	db	CR,LF
+	db	"ESC to return to main menu."	,CR,LF
+	db	"SPACE BAR to scan again."	,CR,LF
+	db	"ENTER to type SSID/AP name."	,CR,LF,LF
+;---
+	db	"Number to connect: "		,STTERMINATOR
+
+MMENU_SCANQM:
+	db	CR,LF
+	db	"ESC to return to main menu."	,CR,LF
+	db	"SPACE BAR to show next page."	,CR,LF
+	db	"ENTER to type SSID/AP name."	,CR,LF,LF
+;---
+	db	"Number to connect: "		,STTERMINATOR
+
+SCAN_TERMINATOR_CUT:
+	db	GOLEFT,GOLEFT,GOLEFT,".. ",GOLEFT,STTERMINATOR
+
+SCAN_TERMINATOR_ENC:
+	db	" *"							,GOLEFT
 
 SCAN_TERMINATOR_OPEN:
 	db	CR,LF,STTERMINATOR
 
-SCAN_TERMINATOR_ENC:
-	db	" *",CR,LF,STTERMINATOR
-
 MMENU_TIMEOUT:
-	db	CLS,"     [ WiFi On Period ]",CR,LF,LF
-	db	"WiFi On Period allows to set",CR,LF
-	db	"a given period of time of",CR,LF
-	db	"inactivity to turn off WiFi",CR,LF
-	db	"automatically.",CR,LF,LF
-	db	"0         - ALWAYS ON",CR,LF
-	db	"1 to 30   - 30s",GOLEFT,CR,LF
-	db	"30 to 600 - Use given period",CR,LF
-	db	"> 600     - 600s",CR,LF,LF,STTERMINATOR
+	db	CLS
+	db	"   [ Set Wi-Fi On Period ]"	,CR,LF,LF
+;---
+	db	"Wi-Fi On Period allows to set"	,GOLEFT,CR,LF
+	db	"a given period of time of"		,CR,LF
+	db	"inactivity to turn off Wi-Fi"	,CR,LF
+	db	"automatically."				,CR,LF,LF
+;---
+	db	"0         - Always on"			,CR,LF
+	db	"1 to 30   - 30s"				,CR,LF
+	db	"31 to 600 - Use given period"	,CR,LF
+	db	"> 600     - 600s"				,CR,LF,LF,STTERMINATOR
+;---
 
 MMENU_TIMEOUT_ALWAYSON:
-	db	"WiFi is ALWAYS ON",CR,LF,LF
-	db	"ESC to return to main menu",CR,LF,LF
-	db	"Type desired period : ",STTERMINATOR
+	db	"Wi-Fi is currently: ALWAYS ON"	,GOLEFT,CR,LF,LF
+;---
+	db	"ESC to return to main menu."	,CR,LF,LF
+;---
+	db	"Type desired period: "			,STTERMINATOR
 
 MMENU_TIMEOUT_NOTALWAYSON1:
-	db	"WiFi period set to ",STTERMINATOR
+	db	"Wi-Fi period set to: "			,STTERMINATOR
+
 MMENU_TIMEOUT_NOTALWAYSON2:
-	db	"s",CR,LF,LF
-	db	"ESC to return to main menu",CR,LF,LF
-	db	"Type desired period : ",STTERMINATOR
+	db	"s"								,CR,LF,LF
+;---
+	db	"ESC to return to main menu."	,CR,LF,LF
+;---
+	db	"Type desired period: "			,STTERMINATOR
 
 MMENU_NAGLE:
-	db	CLS,"     [ Nagle Algorithm ]",CR,LF,LF
-	db	"Nagle Algorithm might lower",CR,LF
-	db	"performance but create less",CR,LF
-	db	"network congestion. Nowadays",CR,LF
-	db	"it is mostly not needed and",CR,LF
-	db	"is the cause of latency and",CR,LF
-	db	"low performance on packet",CR,LF
-	db	"driven protocols.",CR,LF,LF,STTERMINATOR
+	db	CLS
+	db	"   [ Set Nagle Algorithm ]"	,CR,LF,LF
+;---
+	db	"Nagle Algorithm might lower"	,CR,LF
+	db	"performance but create less"	,CR,LF
+	db	"network congestion."			,CR,LF
+	db	"Nowadays it is mostly not"		,CR,LF
+	db	"needed and is the cause of"	,CR,LF
+	db	"latency and low performance"	,CR,LF
+	db	"on packet-driven protocols."	,CR,LF,LF
+;---
+	db	"O - Turn it on/off"			,CR,LF,LF,STTERMINATOR
+;---
 
 MMENU_NAGLE_ON:
-	db	"Nagle Algorithm is ON.",CR,LF,LF
-	db	"ESC to return to main menu",CR,LF,LF
-	db	"O - Turn it off",CR,LF,STTERMINATOR
+	db	"Nagle is currently: ON"		,CR,LF,LF
+;---
+	db	"ESC to return to main menu."	,CR,LF,LF
+;---
+	db	"Option: "						,STTERMINATOR
 
 MMENU_NAGLE_OFF:
-	db	"Nagle Algorithm is OFF.",CR,LF,LF
-	db	"ESC to return to main menu",CR,LF,LF
-	db	"O - Turn it on",CR,LF,STTERMINATOR
+	db	"Nagle is currently: OFF"		,CR,LF,LF
+;---
+	db	"ESC to return to main menu."	,CR,LF,LF
+;---
+	db	"Option: "						,STTERMINATOR
 
 STR_SENDING:
-	db	"Sending command, wait...",CR,LF,STTERMINATOR
+	db	"Sending command, wait..."		,CR,LF,STTERMINATOR
 
 STR_SENDING_OK:
-	db	"Command sent Ok, done!",CR,LF,STTERMINATOR
+	db	"Command sent Ok, done!"		,CR,LF,STTERMINATOR
 
 STR_SENDING_OK_JN:
-	db	"Command Ok, connected!",CR,LF,STTERMINATOR
+	db	"Successfully connected!"		,CR,LF,STTERMINATOR
 
 STR_SENDING_NOK_JN:
-	db	"Fail to connect, if protected",GOLEFT,CR,LF
-	db	"network check password!",CR,LF,STTERMINATOR
-	
+	db	"Fail to connect, if protected"	,GOLEFT,CR,LF
+	db	"network check password!"		,CR,LF,STTERMINATOR
+
 STR_SENDING_FAIL:
-	db	"Command failure...",CR,LF,STTERMINATOR
+	db	"Command failure..."			,CR,LF,STTERMINATOR
 
 STR_CLKUPDT_FAIL:
-	db	"Failure retrieving date and",CR,LF
-	db	"time from SNTP server!",CR,LF,STTERMINATOR
+	db	"Failure retrieving date and"	,CR,LF
+	db	"time from SNTP server!"		,CR,LF,LF
+;---
+	db	"Press and hold F1 during"		,CR,LF
+	db	"system boot to enter setup."	,CR,LF,STTERMINATOR
 
 OK_S:
-	db	"Installed successfully.",CR,LF
-	db	CR,LF,STTERMINATOR
+	db	"Installed successfully!"		,CR,LF,LF,STTERMINATOR
+;---
 
 FAIL_S:
-	db	"ESP8266 Not Found! Check if",CR,LF
-	db	"it is properly connected.",CR,LF,STTERMINATOR
+	db	CLS
+	db	"ESP8266 Not Found!"			,CR,LF,LF
+;---
+	db	"Check that it is properly"		,CR,LF
+	db	"inserted in its connector."	,CR,LF,STTERMINATOR
 
 FAIL_F:
-	db	"ESP8266 Firmware needs update",GOLEFT,CR,LF,STTERMINATOR
+	db	"ESP8266 FW Update Required!"	,CR,LF,STTERMINATOR
+
+STR_WAITING:
+	db	HOME
+	db	"Waiting for connection..."		,CR,LF,LF,LF,STTERMINATOR
+;---
+;---
+
+STR_OOPS:
+	db	CLS
+	db	"Oops! An unexpected error"		,CR,LF
+	db	"occurred on the last reboot."	,CR,LF,STTERMINATOR
 
 ;============================
 ;===  UNAPI related data  ===
@@ -5298,9 +5860,135 @@ UNAPI_ID_END:
 
 ;--- Implementation name (up to 63 chars and zero terminated)
 
-APIINFO:				db	"ESP8266 WiFi UNAPI",0
+APIINFO:				db	"ESP8266 Wi-Fi UNAPI",0
 
+	if	CHECK_OCM_HW = 1
+		if	TURBO_R_LOGO = 0
+ID_END:	ds	#7FE0-ID_END,#C9
+;--- FS-A1GT compliant BIOS without logo (not for FS-A1ST BIOS)
+BUILD_NAME:				db	"[ ESP8266E.ROM ]"
+		else
+ID_END:	ds	#7900-ID_END,#FF
+;--- FS-A1GT compliant BIOS with logo (not for FS-A1ST BIOS)
+	db	#CD,#0E,#79,#F3,#CD,#7D,#7A,#CD,#17,#79,#CD,#12,#79,#C9,#3E,#01
+	db	#18,#01,#AF,#CD,#80,#01,#C9,#21,#FF,#00,#22,#5E,#F5,#21,#5E,#F5
+	db	#11,#60,#F5,#01,#A8,#00,#ED,#B0,#21,#FF,#00,#CD,#54,#7A,#5C,#16
+	db	#1A,#CD,#4C,#7B,#5D,#16,#1B,#CD,#4C,#7B,#CD,#38,#7A,#11,#63,#01
+	db	#CD,#4C,#7B,#06,#15,#C5,#CD,#F8,#79,#DD,#21,#5E,#F5,#FD,#21,#A2
+	db	#79,#06,#2B,#16,#00,#DD,#6E,#00,#DD,#66,#01,#FD,#5E,#00,#B7,#ED
+	db	#52,#30,#03,#21,#00,#00,#DD,#75,#00,#DD,#74,#01,#DD,#23,#DD,#23
+	db	#FD,#23,#DD,#6E,#00,#DD,#66,#01,#FD,#5E,#00,#19,#7C,#FE,#02,#38
+	db	#03,#21,#00,#02,#DD,#75,#00,#DD,#74,#01,#DD,#23,#DD,#23,#FD,#23
+	db	#10,#C3,#C1,#10,#B0,#11,#00,#19,#CD,#4C,#7B,#11,#1F,#02,#CD,#4C
+	db	#7B,#C9,#13,#0D,#15,#12,#14,#0E,#10,#17,#13,#11,#15,#11,#0E,#0D
+	db	#11,#15,#0C,#11,#13,#11,#15,#15,#12,#0C,#0F,#10,#0E,#0E,#15,#0D
+	db	#0F,#11,#11,#11,#17,#14,#0D,#0D,#0C,#0C,#0D,#10,#15,#12,#17,#10
+	db	#0E,#17,#11,#0C,#12,#13,#17,#0E,#16,#14,#14,#0E,#14,#15,#0E,#0E
+	db	#13,#0F,#11,#13,#13,#0F,#17,#15,#0D,#15,#0F,#17,#0C,#0D,#16,#0C
+	db	#11,#0E,#12,#14,#0D,#11,#17,#0D,#21,#5E,#F5,#01,#9B,#55,#5E,#23
+	db	#56,#23,#1B,#7B,#CB,#3A,#1F,#0F,#0F,#3C,#E6,#3F,#57,#1C,#7B,#ED
+	db	#44,#E6,#07,#5F,#3E,#1A,#D3,#99,#3E,#91,#D3,#99,#DB,#99,#DB,#99
+	db	#E6,#20,#CA,#1E,#7A,#ED,#51,#ED,#59,#10,#D3,#11,#00,#1A,#CD,#4C
+	db	#7B,#11,#00,#1B,#CD,#4C,#7B,#C9,#3E,#02,#D3,#99,#3E,#8F,#D3,#99
+	db	#DB,#99,#E6,#40,#28,#FA,#DB,#99,#E6,#40,#20,#FA,#AF,#D3,#99,#3E
+	db	#8F,#D3,#99,#C9,#C9,#1C,#E8,#00,#00,#1C,#E8,#00,#00,#3C,#E8,#00
+	db	#00,#3C,#E8,#00,#00,#5C,#E8,#00,#00,#5C,#E8,#00,#00,#1C,#00,#04
+	db	#00,#3C,#00,#04,#00,#5C,#00,#04,#00,#D8,#00,#00,#00,#CD,#38,#7A
+	db	#11,#23,#01,#CD,#4C,#7B,#CD,#28,#7C,#3E,#55,#21,#00,#00,#4D,#45
+	db	#CD,#75,#7B,#CD,#E1,#7B,#11,#05,#07,#CD,#4C,#7B,#21,#00,#78,#01
+	db	#30,#00,#3E,#FF,#CD,#75,#7B,#21,#30,#78,#01,#10,#00,#3E,#F0,#CD
+	db	#75,#7B,#21,#00,#74,#3E,#05,#01,#00,#02,#CD,#75,#7B,#21,#55,#7A
+	db	#11,#00,#76,#01,#28,#00,#CD,#88,#7B,#11,#03,#19,#CD,#4C,#7B,#11
+	db	#3F,#02,#CD,#4C,#7B,#11,#00,#2D,#CD,#4C,#7B,#16,#2A,#CD,#4C,#7B
+	db	#14,#CD,#4C,#7B,#16,#27,#CD,#4C,#7B,#1E,#20,#21,#DE,#7C,#D9,#21
+	db	#57,#7C,#D9,#3E,#03,#F5,#01,#2D,#00,#16,#26,#CD,#4C,#7B,#D9,#06
+	db	#08,#4E,#23,#D9,#CD,#BB,#7B,#7E,#23,#FE,#FE,#28,#37,#E5,#C5,#01
+	db	#A6,#01,#30,#03,#06,#00,#4F,#CD,#B7,#7B,#E1,#09,#4D,#44,#E1,#F1
+	db	#EE,#03,#CD,#C6,#7B,#F5,#CD,#CF,#7B,#D9,#CB,#21,#10,#04,#06,#08
+	db	#4E,#23,#D9,#30,#CF,#0B,#CD,#BB,#7B,#03,#3E,#02,#CD,#C6,#7B,#CD
+	db	#DC,#7B,#18,#C0,#1C,#F1,#7E,#FE,#FE,#20,#A8,#C9,#F5,#7B,#D3,#99
+	db	#7A,#F6,#80,#D3,#99,#F1,#C9,#3E,#02,#CD,#61,#7B,#0F,#38,#F8,#07
+	db	#C9,#D3,#99,#3E,#8F,#D3,#99,#E5,#E1,#DB,#99,#F5,#AF,#D3,#99,#3E
+	db	#8F,#D3,#99,#F1,#C9,#F5,#CD,#9D,#7B,#79,#B7,#28,#01,#04,#F1,#D3
+	db	#98,#0D,#C2,#7F,#7B,#10,#F8,#C9,#EB,#CD,#9D,#7B,#EB,#79,#B7,#78
+	db	#41,#0E,#98,#28,#01,#3C,#ED,#B3,#3D,#20,#FB,#EB,#C9,#7C,#E6,#3F
+	db	#F6,#40,#08,#7C,#E6,#C0,#07,#07,#D3,#99,#3E,#8E,#D3,#99,#7D,#D3
+	db	#99,#08,#D3,#99,#E3,#E3,#C9,#16,#28,#18,#02,#16,#24,#D5,#59,#CD
+	db	#4C,#7B,#58,#14,#18,#04,#D5,#5F,#16,#2C,#CD,#4C,#7B,#D1,#C9,#D5
+	db	#1E,#70,#16,#2E,#CD,#4C,#7B,#CD,#57,#7B,#D1,#C9,#D5,#1E,#50,#18
+	db	#F1,#3E,#0D,#D3,#B4,#DB,#B5,#E6,#0C,#F6,#02,#D3,#B5,#3E,#0B,#D3
+	db	#B4,#DB,#B5,#07,#07,#E6,#0C,#4F,#06,#00,#21,#47,#7C,#09,#4E,#23
+	db	#46,#C5,#23,#5E,#23,#56,#EB,#11,#00,#10,#CD,#4C,#7B,#CD,#1D,#7C
+	db	#E1,#CD,#1D,#7C,#21,#44,#04,#CD,#1D,#7C,#21,#77,#07,#C5,#0E,#9A
+	db	#ED,#69,#E3,#E3,#ED,#61,#C1,#C9,#06,#08,#21,#37,#7C,#56,#23,#5E
+	db	#23,#CD,#4C,#7B,#10,#F7,#C9,#00,#08,#01,#23,#08,#28,#09,#00,#02
+	db	#1F,#05,#EF,#0B,#00,#06,#0F,#07,#00,#00,#00,#20,#04,#27,#02,#72
+	db	#02,#56,#00,#70,#05,#70,#00,#00,#00,#00,#00,#00,#00,#00,#00,#00
+	db	#6E,#00,#9F,#00,#6F,#00,#9F,#00,#6F,#00,#9F,#00,#6F,#00,#9F,#00
+	db	#6F,#00,#9F,#00,#6F,#00,#9F,#00,#6F,#00,#FF,#00,#07,#00,#FC,#07
+	db	#00,#F7,#00,#07,#00,#F3,#00,#07,#00,#F7,#00,#07,#00,#FF,#00,#07
+	db	#00,#FF,#00,#0F,#00,#FC,#3C,#FC,#3C,#FC,#3C,#87,#C0,#7B,#C0,#87
+	db	#C0,#7B,#C0,#86,#C0,#7B,#C0,#86,#C0,#7A,#C0,#86,#C0,#78,#C0,#86
+	db	#90,#7A,#F0,#86,#F0,#7F,#C0,#83,#C0,#7F,#C0,#D7,#C0,#2F,#C0,#D7
+	db	#C0,#2F,#C0,#D7,#C0,#2F,#C0,#D7,#C0,#2F,#C0,#D7,#C0,#2F,#C0,#D7
+	db	#C0,#2F,#C0,#D5,#80,#00,#00,#00,#00,#00,#00,#00,#00,#00,#FF,#FE
+	db	#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE
+	db	#44,#1D,#1D,#1C,#30,#67,#2B,#28,#22,#FE,#44,#1D,#1C,#1E,#2A,#6D
+	db	#29,#29,#22,#FE,#43,#1F,#1B,#1E,#26,#73,#25,#29,#24,#FE,#43,#1F
+	db	#1A,#20,#22,#77,#23,#29,#25,#FE,#42,#21,#19,#20,#1F,#7C,#1F,#29
+	db	#27,#FE,#42,#21,#18,#22,#1B,#80,#1D,#29,#28,#FE,#41,#23,#17,#22
+	db	#19,#84,#1A,#28,#2A,#FE,#41,#23,#16,#24,#17,#86,#17,#29,#2B,#FE
+	db	#40,#25,#15,#24,#15,#8A,#14,#28,#2D,#FE,#40,#25,#14,#26,#13,#8C
+	db	#11,#29,#2E,#FE,#3F,#27,#13,#26,#12,#8F,#0E,#29,#2F,#FE,#3F,#27
+	db	#12,#28,#10,#91,#0C,#28,#31,#FE,#3E,#29,#11,#28,#0F,#94,#08,#29
+	db	#32,#FE,#3E,#2A,#0F,#2A,#0D,#96,#06,#28,#34,#FE,#3D,#2B,#0E,#2B
+	db	#0C,#99,#02,#29,#35,#FE,#3D,#2C,#0D,#2C,#0B,#C2,#37,#FE,#3C,#2D
+	db	#0C,#2D,#0A,#26,#4C,#50,#38,#FE,#3C,#2E,#0B,#2E,#09,#23,#51,#4C
+	db	#3A,#FE,#3B,#2F,#0A,#2F,#09,#21,#54,#4A,#3B,#FE,#3B,#30,#09,#30
+	db	#08,#20,#57,#46,#3D,#FE,#3A,#31,#08,#31,#08,#21,#57,#44,#3E,#FE
+	db	#3A,#32,#07,#32,#07,#23,#57,#41,#3F,#FE,#39,#33,#06,#33,#07,#26
+	db	#55,#3E,#41,#FE,#39,#34,#05,#34,#07,#46,#36,#3B,#42,#FE,#38,#35
+	db	#04,#35,#07,#4B,#32,#38,#44,#FE,#38,#36,#03,#36,#07,#4E,#30,#35
+	db	#45,#FE,#37,#37,#02,#37,#08,#50,#2E,#32,#47,#FE,#37,#71,#08,#52
+	db	#2D,#2F,#48,#FE,#36,#72,#09,#54,#2B,#2C,#4A,#FE,#36,#73,#09,#55
+	db	#2B,#29,#4B,#FE,#35,#74,#0A,#55,#29,#2A,#4B,#FE,#35,#75,#0B,#55
+	db	#25,#2D,#4A,#FE,#34,#76,#0C,#55,#23,#30,#48,#FE,#34,#1F,#01,#37
+	db	#01,#1F,#0D,#54,#20,#33,#47,#FE,#33,#20,#02,#36,#02,#1E,#10,#52
+	db	#1E,#36,#45,#FE,#33,#1F,#03,#35,#03,#1F,#12,#50,#1B,#39,#44,#FE
+	db	#32,#20,#04,#34,#04,#1E,#15,#4E,#19,#3C,#42,#FE,#32,#1F,#05,#33
+	db	#05,#1F,#18,#4A,#18,#3E,#41,#FE,#31,#20,#06,#32,#06,#1E,#1D,#46
+	db	#15,#42,#3F,#FE,#31,#1F,#07,#31,#07,#1F,#3C,#26,#14,#44,#3E,#FE
+	db	#30,#20,#08,#30,#08,#1E,#40,#22,#12,#48,#3C,#FE,#30,#1F,#09,#2F
+	db	#09,#1F,#41,#20,#11,#4A,#3B,#FE,#2F,#20,#0A,#2E,#0A,#1E,#41,#20
+	db	#0F,#4E,#39,#FE,#2F,#1F,#0B,#2D,#0B,#1F,#40,#20,#0E,#28,#01,#27
+	db	#38,#FE,#2E,#20,#0C,#2C,#0C,#1E,#3E,#22,#0C,#29,#04,#27,#36,#FE
+	db	#2E,#1F,#0D,#2B,#0D,#1F,#39,#26,#0B,#29,#06,#27,#35,#FE,#2D,#20
+	db	#0E,#2A,#0E,#7D,#0A,#28,#0A,#27,#33,#FE,#2D,#1F,#0F,#29,#0F,#7C
+	db	#09,#29,#0C,#27,#32,#FE,#2C,#20,#10,#28,#10,#7B,#08,#28,#10,#27
+	db	#30,#FE,#2C,#1F,#11,#27,#11,#7A,#07,#29,#12,#27,#2F,#FE,#2B,#1F
+	db	#13,#25,#13,#78,#07,#28,#16,#27,#2D,#FE,#2B,#1F,#13,#25,#13,#77
+	db	#06,#29,#18,#27,#2C,#FE,#2A,#1F,#15,#23,#15,#75,#06,#28,#1C,#27
+	db	#2A,#FE,#2A,#1F,#15,#23,#15,#74,#06,#27,#1F,#27,#29,#FE,#29,#1F
+	db	#17,#21,#17,#71,#06,#28,#22,#27,#27,#FE,#29,#1F,#17,#21,#17,#70
+	db	#06,#27,#25,#27,#26,#FE,#28,#1F,#19,#1F,#19,#6D,#06,#28,#28,#27
+	db	#24,#FE,#28,#1F,#19,#1F,#19,#6A,#08,#27,#2B,#27,#23,#FE,#27,#1F
+	db	#1B,#1D,#1B,#66,#09,#28,#2E,#27,#21,#FE,#27,#1F,#1B,#1D,#1B,#63
+	db	#0B,#27,#31,#27,#20,#FE,#26,#1F,#1D,#1B,#1D,#5F,#0C,#28,#34,#27
+	db	#1E,#FE,#26,#1F,#1D,#1B,#1D,#5A,#0F,#28,#37,#27,#1D,#FE,#FF,#FE
+	db	#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE,#FF,#FE
+	db	#FE,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF
+	db	#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF
+	db	#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF
+	db	#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF,#FF
+BUILD_NAME:				db	"[ ESP8266M.ROM ]"
+		endif
+	else
+ID_END:	ds	#7FE0-ID_END,#FF
+BUILD_NAME:				db	"[ ESP8266 .ROM ]"
+	endif
+;--- Build date to be viewed via Hex Editor (16 bytes)
 
-ID_END:	ds	#8000-ID_END,#FF
+BUILD_DATE:				db	"BUILD 2020/08/04"
+
 SEG_CODE_END:
-;Final size must be 16384 bytes 
+; Final size must be 16384 bytes
