@@ -42,9 +42,18 @@
 #include <stdio.h>
 #include "XYMODEM.h"
 #include "print.h"
+#ifdef AO_FOSSIL_ADAPTER
+#include "16C550CZiModem.h"
+#endif // AO_FOSSIL_ADAPTER
 
 //X and YMODEM Vars
+#ifdef AO_FOSSIL_ADAPTER
+#define RcvPktSize 2200
+unsigned char RcvPkt[RcvPktSize];
+#else
 __at 0x8500 unsigned char RcvPkt[]; //make sure it works in your map file, need to be in 0x8000 and beyond
+#endif // AO_FOSSIL_ADAPTER
+
 unsigned char filename[20];
 //Indicates G-Modem transfer in progress
 unsigned char G;
@@ -371,6 +380,7 @@ unsigned char XYModemPacketReceive (int *File, unsigned char Action, unsigned ch
                         }
 
                         strcpy (filename, &ucReadBuffer[3]);
+
                         *File = Open (&ucReadBuffer[3],O_CREAT);
                         if (*File != -1)
                         {
@@ -395,6 +405,9 @@ unsigned char XYModemPacketReceive (int *File, unsigned char Action, unsigned ch
                     //Ok, write it
                     if (is1K)
                     {
+#ifdef AO_FOSSIL_ADAPTER
+                        StopReceivingData();
+#endif // AO_FOSSIL_ADAPTER
                         // In YModem keep track of file size and received file size
                         if (isYmodem)
                             ReceivedSize += 1024;
@@ -410,9 +423,15 @@ unsigned char XYModemPacketReceive (int *File, unsigned char Action, unsigned ch
                                 Write(*File, &ucReadBuffer[3],1024);
                         else //XMODEM you just save everything and file could be padded
                             Write(*File, &ucReadBuffer[3],1024);
+#ifdef AO_FOSSIL_ADAPTER
+                        ResumeReceivingData();
+#endif // AO_FOSSIL_ADAPTER
                     }
                     else
                     {
+#ifdef AO_FOSSIL_ADAPTER
+                        StopReceivingData();
+#endif // AO_FOSSIL_ADAPTER
                         //Same as above, but for 128 bytes blocks
                         if (isYmodem)
                             ReceivedSize += 128;
@@ -426,6 +445,9 @@ unsigned char XYModemPacketReceive (int *File, unsigned char Action, unsigned ch
                                 Write(*File, &ucReadBuffer[3],128);
                         else
                             Write(*File, &ucReadBuffer[3],128);
+#ifdef AO_FOSSIL_ADAPTER
+                        ResumeReceivingData();
+#endif // AO_FOSSIL_ADAPTER
                     }
                     //Set time out as 0 to indicate success
                     TimeOut = 0;

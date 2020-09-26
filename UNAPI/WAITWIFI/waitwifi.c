@@ -1,6 +1,8 @@
 /*
 --
 -- waitwifi.c
+--   Changed the animation, so it won't show the Yen sign on japanese roms
+--
 --   Added explanation about /T
 --   KdL updated the animation so it won't update as much as it was updating before,
 --   so it is easier on the eye
@@ -47,7 +49,6 @@
 #include <string.h>
 #include "asm.h"
 
-__at 0xFC9E unsigned int TickCount;
 unsigned char uchMessage[255];
 #define _TERM0 0
 
@@ -89,7 +90,7 @@ enum TcpipErrorCodes {
     ERR_INV_OPER
 };
 
-const char strPresentation[] = "UNAPI TCP Wait Connection Tool v0.13\r\n(c)2020 Oduvaldo Pavan Junior - ducasp@gmail.com\r\n\n";
+const char strPresentation[] = "UNAPI TCP Wait Connection Tool v0.14\r\n(c)2020 Oduvaldo Pavan Junior - ducasp@gmail.com\r\n\n";
 
 Z80_registers regs;
 int i;
@@ -167,11 +168,10 @@ void PrintImplementationName()
 int main (char** argv, int argc)
 {
     unsigned int Time0,Time1,TimeOut,TimeLeap;
-    unsigned char advance[4] = {'-','\\','|','/'};
 
     TickCount = 0;
 
-    Time0 = TickCount + 5;
+    Time0 = TickCount + 10;
     // Timeout for a packet
     Time1 = TickCount;
     TimeOut = 600 + Time1;
@@ -191,7 +191,7 @@ int main (char** argv, int argc)
         print(strPresentation);
 
     i = UnapiGetCount("TCP/IP");
-    if(i==0)
+    if (i==0)
     {
         print("No TCP/IP UNAPI implementations found\r\n\n");
         return 1;
@@ -227,9 +227,12 @@ int main (char** argv, int argc)
         // Our nice animation to show we are not stuck
         if (TickCount>Time0)
         {
-            Time0 = TickCount + 5;
-            printChar(advance[i%4]); // next char
-            printChar(29); // move left a char
+            // 1000/60*9 = 150ms per frame
+            Time0 = TickCount + 9;
+            if (i%4==0) print("|   \x1d\x1d\x1d\x1d");
+            if (i%4==1) print("|)  \x1d\x1d\x1d\x1d");
+            if (i%4==2) print("|)) \x1d\x1d\x1d\x1d");
+            if (i%4==3) print("|)))\x1d\x1d\x1d\x1d");
             ++i;
         }
         // Check Connection
